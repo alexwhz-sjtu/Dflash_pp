@@ -3,23 +3,52 @@
 
 set -e
 
+# 自动激活虚拟环境
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(dirname "${SCRIPT_DIR}")"
+if [ -f "${PROJECT_DIR}/.venv/bin/activate" ]; then
+    source "${PROJECT_DIR}/.venv/bin/activate"
+fi
+
 # ========================================
 # 配置参数
 # ========================================
 
 # GPU 设置
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-6,7}"
-NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 MASTER_PORT="${MASTER_PORT:-29500}"
 
 # 目标模型路径
-TARGET_MODEL="${TARGET_MODEL:-/share/public/public_models/Qwen3-8B}"
+TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
 
-# 数据目录
-TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-./cache/dataset/train/nemotron_400000_train_regen.jsonl}"
+# 训练参数（MAX_LENGTH 需要在数据路径构建之前定义）
+NUM_EPOCHS="${NUM_EPOCHS:-6}"
+BATCH_SIZE="${BATCH_SIZE:-4}"
+ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-1}"
+LEARNING_RATE="${LEARNING_RATE:-6e-4}"
+MAX_LENGTH="${MAX_LENGTH:-4096}"
+WARMUP_RATIO="${WARMUP_RATIO:-0.04}"
+MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
+
+# 数据特征参数（用于自动构建数据路径）
+DATA_NUM_SAMPLES="${DATA_NUM_SAMPLES:-600000}"
+ENABLE_THINKING="${ENABLE_THINKING:-on}"
+
+# 构建数据子目录名: n{N|all}_think_{on|off}
+DATASET_BASE_DIR="${DATASET_BASE_DIR:-./cache/dataset}"
+if [ "${ENABLE_THINKING}" = "on" ] || [ "${ENABLE_THINKING}" = "true" ] || [ "${ENABLE_THINKING}" = "1" ]; then
+    THINK_STR="on"
+else
+    THINK_STR="off"
+fi
+DATA_SUBDIR="n${DATA_NUM_SAMPLES}_think_${THINK_STR}"
+
+# 数据目录（支持通过 TRAIN_DATA_PATH 直接指定，否则自动构建）
+TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-${DATASET_BASE_DIR}/${DATA_SUBDIR}/train_regen.jsonl}"
 EVAL_DATA_PATH="${EVAL_DATA_PATH:-}"
-OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_draft_model}"
-CACHE_DIR="${CACHE_DIR:-./cache/dataset/train}"
+OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_${DATA_SUBDIR}_maxlen${MAX_LENGTH}}"
+CACHE_DIR="${CACHE_DIR:-${DATASET_BASE_DIR}/${DATA_SUBDIR}}"
 
 # 模型参数
 NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"
@@ -30,19 +59,10 @@ NUM_ANCHORS="${NUM_ANCHORS:-512}"
 CONCAT_MODE="${CONCAT_MODE:-seq}"  # "seq" 或 "feature"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}"
 
-# 训练参数
-NUM_EPOCHS="${NUM_EPOCHS:-6}"
-BATCH_SIZE="${BATCH_SIZE:-1}"
-ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-4}"
-LEARNING_RATE="${LEARNING_RATE:-6e-4}"
-MAX_LENGTH="${MAX_LENGTH:-4096}"
-WARMUP_RATIO="${WARMUP_RATIO:-0.04}"
-MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
-
 # 日志和保存间隔
-LOG_INTERVAL="${LOG_INTERVAL:-50}"
-SAVE_INTERVAL="${SAVE_INTERVAL:-1000}"
-EVAL_INTERVAL="${EVAL_INTERVAL:-1000}"
+LOG_INTERVAL="${LOG_INTERVAL:-1000}"
+SAVE_INTERVAL="${SAVE_INTERVAL:-50000}"
+EVAL_INTERVAL="${EVAL_INTERVAL:-10000}"
 
 # Tracker 参数
 REPORT_TO="${REPORT_TO:-none}"  # none, wandb, tensorboard
@@ -69,6 +89,11 @@ CKPT_DIR="${CKPT_DIR:-}"
 echo "=========================================="
 echo "FlashMTP 训练启动脚本"
 echo "=========================================="
+echo "数据特征:"
+echo "  样本数量: ${DATA_NUM_SAMPLES}"
+echo "  思考模式: ${THINK_STR}"
+echo "  数据子目录: ${DATA_SUBDIR}"
+echo "------------------------------------------"
 echo "目标模型: ${TARGET_MODEL}"
 echo "训练数据: ${TRAIN_DATA_PATH}"
 echo "评估数据: ${EVAL_DATA_PATH:-无}"

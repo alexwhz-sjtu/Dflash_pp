@@ -2,6 +2,12 @@
 This script will re-generate the dataset from target model,
 which better aligns the draft model with the target model’s output distribution.
 
+Output files are organized by (num_samples, enable_thinking):
+  cache/dataset/n{N|all}_think_{on|off}/train_regen.jsonl
+
+max_tokens is set large by default (32768) to collect complete data.
+Truncation is handled later during training via --max-length.
+
 Usage:
 1. Set up one or more SGLang servers for the target model.
 
@@ -20,11 +26,17 @@ python3 -m sglang.launch_server \
 python scripts/regenerate_train_data.py \
     --model meta-llama/Llama-3.1-8B-Instruct \
     --concurrency 64 \
-    --max-tokens 4096 \
+    --num-samples 50000 \
+    --enable-thinking \
     --server-address localhost:30000 \
     --temperature 0.8 \
-    --input-file-path ./cache/dataset/sharegpt_train.jsonl \
-    --output-file-path ./cache/dataset/sharegpt_train_regen.jsonl
+    --input-file-path ./cache/dataset/sharegpt_train.jsonl
+
+Output will be saved to:
+  ./cache/dataset/n50000_think_on/train_regen.jsonl
+
+You can also explicitly specify the output path:
+    --output-file-path ./cache/dataset/custom_output.jsonl
 """
 
 import argparse
@@ -57,6 +69,11 @@ def parse_arguments():
         action="store_true",
         help="Whether the model is a GPT-OSS model",
     )
+    model_group.add_argument(
+        "--enable-thinking",
+        action="store_true",
+        help="Enable thinking mode for the model (affects enable_thinking in chat_template_kwargs)",
+    )
 
     # sampling params
     sampling_params_group = parser.add_argument_group("sampling parameters")
@@ -87,8 +104,8 @@ def parse_arguments():
     sampling_params_group.add_argument(
         "--max-tokens",
         type=int,
-        default=4096,
-        help="Maximum number of tokens (default: 4096)",
+        default=32768,
+        help="Maximum number of tokens per generation (default: 32768, set large to collect complete data)",
     )
 
     # optimization
@@ -106,7 +123,13 @@ def parse_arguments():
         "--input-file-path", type=str, required=True, help="Path to the input file"
     )
     data_group.add_argument(
-        "--output-file-path", type=str, required=True, help="Path to the output file"
+        "--output-file-path", type=str, default=None,
+        help="Path to the output file. If not provided, auto-generated as "
+             "{dataset-base-dir}/n{num_samples|all}_think_{on|off}/train_regen.jsonl"
+    )
+    data_group.add_argument(
+        "--dataset-base-dir", type=str, default="./cache/dataset",
+        help="Base directory for dataset files (default: ./cache/dataset)"
     )
     data_group.add_argument(
         "--num-samples",
@@ -144,6 +167,31 @@ def get_random_reasoning_effort() -> str:
     return random.choices(reasoning_efforts, weights=weights, k=1)[0]
 
 
+def build_dataset_subdir(num_samples, enable_thinking: bool) -> str:
+    """Build dataset subdirectory name from data collection features.
+
+    Format: n{num_samples|all}_think_{on|off}
+    Examples:
+        n50000_think_on
+        nall_think_off
+    """
+    n_str = str(num_samples) if num_samples is not None else "all"
+    think_str = "on" if enable_thinking else "off"
+    return f"nemotron_n{n_str}_think_{think_str}"
+
+
+def resolve_output_path(args):
+    """Resolve the output file path from args.
+
+    If --output-file-path is provided, use it directly.
+    Otherwise, auto-generate from --dataset-base-dir, num_samples, and enable_thinking.
+    """
+    if args.output_file_path is not None:
+        return args.output_file_path
+    subdir = build_dataset_subdir(args.num_samples, args.enable_thinking)
+    return os.path.join(args.dataset_base_dir, subdir, "train_regen.jsonl")
+
+
 def compute_context_length(conversations: List[Dict[str, Any]]) -> int:
     """
     This is a rough estimate of the context length measured in untokenized
@@ -179,7 +227,8 @@ def build_query_kwargs(args, messages, max_tokens=None):
     if args.repetition_penalty is not None:
         query_kwargs["presence_penalty"] = args.repetition_penalty
 
-    extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
+    # if adding enable_thinking in args, than think mode
+    extra_body = {"chat_template_kwargs": {"enable_thinking": args.enable_thinking}}
     
     if args.top_k is not None:
         extra_body["top_k"] = args.top_k
@@ -246,6 +295,11 @@ def main():
     # Parse command line arguments
     args = parse_arguments()
 
+    # Resolve output file path (auto-generate if not explicitly provided)
+    output_file_path = resolve_output_path(args)
+    os.makedirs(os.path.dirname(output_file_path), exist_ok=True)
+    print(output_file_path)
+
     # Validate parameters
     if not (0.0 <= args.temperature <= 1.0):
         raise ValueError("Temperature must be between 0.0 and 1.0")
@@ -260,16 +314,16 @@ def main():
     print(f"  Temperature: {args.temperature}")
     print(f"  API URL: {args.server_address}")
     print(f"  Input file: {args.input_file_path}")
-    print(f"  Output file: {args.output_file_path}")
+    print(f"  Output file: {output_file_path}")
     print(f"  Resume mode: {args.resume}")
     print("-" * 50)
     total_lines = sum(1 for _ in open(args.input_file_path))
 
     skip_lines = 0
-    error_file_path = args.output_file_path.replace(".jsonl", "_error.jsonl")
+    error_file_path = output_file_path.replace(".jsonl", "_error.jsonl")
 
-    if args.resume and os.path.exists(args.output_file_path):
-        existing_success = sum(1 for _ in open(args.output_file_path))
+    if args.resume and os.path.exists(output_file_path):
+        existing_success = sum(1 for _ in open(output_file_path))
         existing_error = 0
         if os.path.exists(error_file_path):
             existing_error = sum(1 for _ in open(error_file_path))
@@ -311,7 +365,7 @@ def main():
     # Determine file open mode based on resume flag
     file_mode = "a" if (args.resume and skip_lines > 0) else "w"
     print(
-        f"Regenerating dataset and saving the output to {args.output_file_path} and error log to {error_file_path}"
+        f"Regenerating dataset and saving the output to {output_file_path} and error log to {error_file_path}"
     )
     print(
         f"File open mode: {file_mode} ({'append' if file_mode == 'a' else 'overwrite'})"
@@ -326,7 +380,7 @@ def main():
     # Create progress bar
     with (
         open(args.input_file_path, "r") as input_file,
-        open(args.output_file_path, file_mode) as output_file_handle,
+        open(output_file_path, file_mode) as output_file_handle,
         open(error_file_path, file_mode) as error_file_handle,
     ):
         executor = ThreadPoolExecutor(

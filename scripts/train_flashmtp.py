@@ -74,8 +74,16 @@ def parse_args():
     )
 
     dataset_group = parser.add_argument_group("dataset")
-    dataset_group.add_argument("--train-data-path", type=str, required=True)
+    dataset_group.add_argument("--train-data-path", type=str, default=None,
+        help="Path to training data. If not provided, auto-constructed from "
+             "--dataset-base-dir, --data-num-samples, and --data-enable-thinking.")
     dataset_group.add_argument("--eval-data-path", type=str, default=None)
+    dataset_group.add_argument("--dataset-base-dir", type=str, default="./cache/dataset",
+        help="Base directory for dataset files (default: ./cache/dataset)")
+    dataset_group.add_argument("--data-num-samples", type=str, default="all",
+        help="Number of samples used during data generation, or 'all' (for path construction)")
+    dataset_group.add_argument("--data-enable-thinking", action="store_true",
+        help="Whether thinking mode was enabled during data generation (for path construction)")
     dataset_group.add_argument("--chat-template", type=str, default="qwen")
     dataset_group.add_argument("--is-preformatted", action="store_true")
     dataset_group.add_argument("--dataloader-num-workers", type=int, default=8)
@@ -342,6 +350,18 @@ def main():
     )
 
     args = parse_args()
+
+    # Resolve train data path from feature args if not explicitly provided
+    if args.train_data_path is None:
+        think_str = "on" if args.data_enable_thinking else "off"
+        n_str = args.data_num_samples
+        subdir = f"n{n_str}_think_{think_str}"
+        args.train_data_path = os.path.join(args.dataset_base_dir, subdir, "train_regen.jsonl")
+
+    # Auto-set cache_dir to the same subdir if using default
+    if args.cache_dir == "./cache/train":
+        args.cache_dir = os.path.dirname(args.train_data_path)
+
     set_seed(args.seed)
 
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
