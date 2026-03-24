@@ -68,6 +68,7 @@ class OnlineFlashMTPModel(nn.Module):
         self.num_anchors = num_anchors
         self.attention_backend = attention_backend
         self.concat_mode = concat_mode
+        self.num_target_layers = getattr(draft_model.config, "num_target_layers", 1)
 
         # 自动设置gamma
         if loss_decay_gamma is None:
@@ -220,13 +221,21 @@ class OnlineFlashMTPModel(nn.Module):
         2. 块内双向注意力
         3. 不同块之间不可见
         """
+        B, N = anchor_positions.shape
+        if target_hidden_len % N != 0:
+            raise ValueError(
+                f"target_hidden_len ({target_hidden_len}) must be divisible by n_blocks ({N})"
+            )
+        context_tokens_per_block = target_hidden_len // N
+
         def mask_mod(b, h, q_idx, kv_idx):
             q_block_id = q_idx // self.block_size
 
-            # Context部分（target_hidden）- 每个块对应一个独立的context token
+            # Context部分（target_hidden）- 每个块对应context_tokens_per_block个token
             is_context = kv_idx < target_hidden_len
-            # 只允许看到本块对应的context token
-            mask_context = is_context & (kv_idx == q_block_id)
+            block_ctx_start = q_block_id * context_tokens_per_block
+            block_ctx_end = block_ctx_start + context_tokens_per_block
+            mask_context = is_context & (kv_idx >= block_ctx_start) & (kv_idx < block_ctx_end)
 
             # Block部分
             is_draft = kv_idx >= target_hidden_len
@@ -238,7 +247,6 @@ class OnlineFlashMTPModel(nn.Module):
 
             return (mask_context | mask_draft) & is_valid_block
 
-        B, N = anchor_positions.shape
         Q_LEN = N * self.block_size
         KV_LEN = target_hidden_len + N * self.block_size
 
@@ -265,12 +273,14 @@ class OnlineFlashMTPModel(nn.Module):
         返回: [B, 1, Q_LEN, KV_LEN] 的布尔掩码，True表示可以attend
         """
         B, N = anchor_positions.shape
+        if target_hidden_len % N != 0:
+            raise ValueError(
+                f"target_hidden_len ({target_hidden_len}) must be divisible by n_blocks ({N})"
+            )
+        context_tokens_per_block = target_hidden_len // N
+
         Q_LEN = N * self.block_size
         KV_LEN = target_hidden_len + N * self.block_size
-
-        # 创建query和key的块ID
-        q_block_ids = torch.arange(Q_LEN, device=device) // self.block_size  # [Q_LEN]
-        q_block_ids = q_block_ids.unsqueeze(0).expand(B, -1)  # [B, Q_LEN]
 
         # 创建mask
         mask = torch.zeros(B, 1, Q_LEN, KV_LEN, dtype=torch.bool, device=device)
@@ -279,9 +289,10 @@ class OnlineFlashMTPModel(nn.Module):
             for q_idx in range(Q_LEN):
                 q_block = q_idx // self.block_size
 
-                # 可以attend到对应的context token
-                if q_block < target_hidden_len:
-                    mask[b, 0, q_idx, q_block] = True
+                # 可以attend到本块对应的context tokens
+                ctx_start = q_block * context_tokens_per_block
+                ctx_end = ctx_start + context_tokens_per_block
+                mask[b, 0, q_idx, ctx_start:ctx_end] = True
 
                 # 可以attend到同块的noise token（双向）
                 kv_start = target_hidden_len + q_block * self.block_size
@@ -333,30 +344,59 @@ class OnlineFlashMTPModel(nn.Module):
         position_ids = self._create_position_ids(anchor_positions)
 
         # 提取target_hidden（每个anchor位置对应的hidden state）
-        # target_hidden: [bsz, n_blocks, feature_dim]
         n_blocks = anchor_positions.shape[1]
-        target_hidden_list = []
+
+        if self.concat_mode == "seq":
+            expected_seq_len = seq_len * self.num_target_layers
+            if hidden_states.shape[1] != expected_seq_len:
+                raise ValueError(
+                    "For seq mode, hidden_states must be concatenated along sequence dim "
+                    f"with shape [bsz, seq_len * num_target_layers, hidden_size]. "
+                    f"Got shape {tuple(hidden_states.shape)}, expected second dim {expected_seq_len}."
+                )
+        elif self.concat_mode == "feature":
+            expected_feature_dim = self.draft_model.config.hidden_size * self.num_target_layers
+            if hidden_states.shape[-1] != expected_feature_dim:
+                raise ValueError(
+                    "For feature mode, hidden_states must be concatenated along feature dim "
+                    f"with shape [bsz, seq_len, hidden_size * num_target_layers]. "
+                    f"Got shape {tuple(hidden_states.shape)}, expected last dim {expected_feature_dim}."
+                )
+        else:
+            raise ValueError(f"Unsupported concat_mode: {self.concat_mode}")
+
+        # 按batch维度收集，保持正确的batch结构
+        batch_target_hidden_list = []
         for b in range(bsz):
+            block_hidden_list = []
             for n in range(n_blocks):
                 if block_keep_mask[b, n]:
                     pos = anchor_positions[b, n].item()
-                    target_hidden_list.append(hidden_states[b:b+1, pos:pos+1, :])
+
+                    if self.concat_mode == "seq":
+                        layer_positions = (
+                            torch.arange(self.num_target_layers, device=device) * seq_len + pos
+                        )
+                        block_hidden_list.append(hidden_states[b, layer_positions, :])
+                    else:
+                        block_hidden_list.append(hidden_states[b, pos:pos+1, :])
                 else:
                     # 无效块用零填充
-                    target_hidden_list.append(torch.zeros(
-                        1, 1, hidden_states.shape[-1],
-                        dtype=hidden_states.dtype, device=device
-                    ))
+                    if self.concat_mode == "seq":
+                        block_hidden_list.append(torch.zeros(
+                            self.num_target_layers, hidden_states.shape[-1],
+                            dtype=hidden_states.dtype, device=device
+                        ))
+                    else:
+                        block_hidden_list.append(torch.zeros(
+                            1, hidden_states.shape[-1],
+                            dtype=hidden_states.dtype, device=device
+                        ))
+            # 将当前batch的所有block在seq维度拼接
+            batch_target_hidden_list.append(torch.cat(block_hidden_list, dim=0))
 
-        # 拼接target_hidden
-        if self.concat_mode == "feature":
-            # 特征维度拼接（最后一个维度）：[bsz, 1, n_blocks * feature_dim]
-            # 适用于多个anchor位置的hidden states在特征维度拼接
-            target_hidden = torch.cat(target_hidden_list, dim=-1)  # dim=-1 特征维度
-        else:
-            # 序列维度拼接（默认）：[bsz, n_blocks, feature_dim]
-            # 每个块一个独立的context token
-            target_hidden = torch.cat(target_hidden_list, dim=1)  # dim=1 序列维度
+        # 拼接所有batch的target_hidden，保持batch维度
+        target_hidden = torch.stack(batch_target_hidden_list, dim=0)
 
         # 创建attention mask
         target_hidden_len = target_hidden.shape[1]  # n_blocks

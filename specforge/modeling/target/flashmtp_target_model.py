@@ -48,8 +48,9 @@ class FlashMTPTargetModel(ABC):
 class HFFlashMTPTargetModel(FlashMTPTargetModel):
     """HuggingFace backend for FlashMTP target model."""
 
-    def __init__(self, model: nn.Module):
+    def __init__(self, model: nn.Module, concat_mode: str = "feature"):
         self.model = model
+        self.concat_mode = concat_mode
 
     @classmethod
     def from_pretrained(
@@ -59,6 +60,7 @@ class HFFlashMTPTargetModel(FlashMTPTargetModel):
         device: str = "cuda",
         cache_dir: Optional[str] = None,
         trust_remote_code: bool = False,
+        concat_mode: str = "feature",
         **kwargs,
     ) -> "HFFlashMTPTargetModel":
         tp_size = get_tp_group().size()
@@ -81,7 +83,7 @@ class HFFlashMTPTargetModel(FlashMTPTargetModel):
             **kwargs,
         )
         model.eval()
-        return cls(model)
+        return cls(model, concat_mode=concat_mode)
 
     @torch.no_grad()
     def generate_hidden_states(
@@ -96,7 +98,16 @@ class HFFlashMTPTargetModel(FlashMTPTargetModel):
             output_hidden_states=True,
             use_cache=False,
         )
-        hidden_states = outputs.hidden_states[-1]
+
+        # outputs.hidden_states[0] is embedding output, skip it and keep decoder layers only.
+        decoder_hidden_states = outputs.hidden_states[1:]
+        if self.concat_mode == "seq":
+            hidden_states = torch.cat(decoder_hidden_states, dim=1)
+        elif self.concat_mode == "feature":
+            hidden_states = torch.cat(decoder_hidden_states, dim=-1)
+        else:
+            raise ValueError(f"Unsupported concat_mode: {self.concat_mode}")
+
         return FlashMTPTargetOutput(
             hidden_states=hidden_states,
             input_ids=input_ids,

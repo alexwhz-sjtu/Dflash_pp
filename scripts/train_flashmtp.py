@@ -350,6 +350,8 @@ def main():
     draft_model, tokenizer = build_models(args)
 
     draft_model_last_checkpoint = None
+    resume_epoch = None
+    resume_step = None
     if args.ckpt_dir is not None:
         if os.path.isdir(args.ckpt_dir):
             draft_model_last_checkpoint = args.ckpt_dir
@@ -360,10 +362,19 @@ def main():
             )
 
     if args.resume and os.path.isdir(args.output_dir):
-        draft_model_last_checkpoint, ckpt_info = get_last_checkpoint(
+        found_checkpoint, found_epoch, found_step = get_last_checkpoint(
             args.output_dir, prefix=r"epoch_\d+_step"
         )
-        print_on_rank0(f"Last checkpoint detected: {draft_model_last_checkpoint}")
+        if found_checkpoint is not None:
+            draft_model_last_checkpoint = found_checkpoint
+            resume_epoch = found_epoch
+            resume_step = found_step
+            print_on_rank0(
+                f"Last checkpoint detected: {draft_model_last_checkpoint}, "
+                f"epoch={resume_epoch}, step={resume_step}"
+            )
+        else:
+            print_on_rank0(f"No checkpoint found in {args.output_dir}, starting from scratch")
 
     resume_state = None
     if draft_model_last_checkpoint:
@@ -415,6 +426,7 @@ def main():
             device="cuda",
             cache_dir=args.model_download_dir,
             trust_remote_code=args.trust_remote_code,
+            concat_mode=args.concat_mode,
         )
         print_on_rank0("Target model loaded for online mode")
 
@@ -447,12 +459,19 @@ def main():
         total_steps=total_steps,
     )
 
-    start_epoch = ckpt_info[0] if 'ckpt_info' in dir() else 0
-    global_step = ckpt_info[1] if 'ckpt_info' in dir() else 0
+    start_epoch = resume_epoch if resume_epoch is not None else 0
+    global_step = resume_step if resume_step is not None else 0
     if resume_state is not None:
         optimizer.scheduler.load_state_dict(resume_state["scheduler_state_dict"])
         start_epoch = resume_state["epoch"]
         global_step = resume_state["global_step"]
+        # Restore wandb_run_id from checkpoint if not already set
+        if (
+            hasattr(args, "wandb_run_id")
+            and args.wandb_run_id is None
+            and hasattr(resume_state["args"], "wandb_run_id")
+        ):
+            args.wandb_run_id = resume_state["args"].wandb_run_id
         del resume_state
         print_on_rank0(f"Restored scheduler, lr={optimizer.get_learning_rate():.6f}")
 
@@ -461,6 +480,21 @@ def main():
     print_on_rank0(f"Initializing tracker (report_to={args.report_to})...")
     tracker = create_tracker(args, args.output_dir)
     print_on_rank0("Tracker initialized successfully.")
+
+    # Capture wandb run id for future checkpoint saves (if using wandb)
+    if (
+        args.report_to == "wandb"
+        and hasattr(args, "wandb_run_id")
+        and args.wandb_run_id is None
+    ):
+        try:
+            import wandb
+
+            if wandb.run is not None:
+                args.wandb_run_id = wandb.run.id
+                print_on_rank0(f"Captured wandb run id: {args.wandb_run_id}")
+        except ImportError:
+            pass
 
     last_time = time.time()
     print_on_rank0(f"Starting training from epoch {start_epoch}, step {global_step}")

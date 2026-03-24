@@ -179,7 +179,7 @@ def build_query_kwargs(args, messages, max_tokens=None):
     if args.repetition_penalty is not None:
         query_kwargs["presence_penalty"] = args.repetition_penalty
 
-    extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
+    extra_body = {"chat_template_kwargs": {"enable_thinking": True}}
     
     if args.top_k is not None:
         extra_body["top_k"] = args.top_k
