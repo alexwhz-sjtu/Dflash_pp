@@ -101,8 +101,6 @@ class Qwen3FlashMTPAttention(nn.Module):
         q = self.q_norm(q).transpose(1, 2)
         k_ctx = self.k_proj(target_hidden)
 
-        assert ctx_len==1, f"Expected k_ctx sequence length 1, got {ctx_len}"
-
         k_noise = self.k_proj(hidden_states)
         v_ctx = self.v_proj(target_hidden)
         v_noise = self.v_proj(hidden_states)
