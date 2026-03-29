@@ -2,8 +2,8 @@
 This script will re-generate the dataset from target model,
 which better aligns the draft model with the target model’s output distribution.
 
-Output files are organized by (num_samples, enable_thinking):
-  cache/dataset/n{N|all}_think_{on|off}/train_regen.jsonl
+Output files are organized by (dataset_name, enable_thinking, samples, model):
+  cache/data/regen_data/{dataset}_think_{on|off}_samples_{count}_{model}_regen.jsonl
 
 max_tokens is set large by default (32768) to collect complete data.
 Truncation is handled later during training via --max-length.
@@ -33,7 +33,7 @@ python scripts/regenerate_train_data.py \
     --input-file-path ./cache/dataset/sharegpt_train.jsonl
 
 Output will be saved to:
-  ./cache/dataset/n50000_think_on/train_regen.jsonl
+  ./cache/data/regen_data/sharegpt_think_on_samples_50000_meta-llama_Llama-3.1-8B-Instruct_regen.jsonl
 
 You can also explicitly specify the output path:
     --output-file-path ./cache/dataset/custom_output.jsonl
@@ -125,11 +125,7 @@ def parse_arguments():
     data_group.add_argument(
         "--output-file-path", type=str, default=None,
         help="Path to the output file. If not provided, auto-generated as "
-             "{dataset-base-dir}/n{num_samples|all}_think_{on|off}/train_regen.jsonl"
-    )
-    data_group.add_argument(
-        "--dataset-base-dir", type=str, default="./cache/dataset",
-        help="Base directory for dataset files (default: ./cache/dataset)"
+             "./cache/data/regen_data/{dataset}_think_{on|off}_samples_{count}_{model}_regen.jsonl"
     )
     data_group.add_argument(
         "--num-samples",
@@ -167,29 +163,64 @@ def get_random_reasoning_effort() -> str:
     return random.choices(reasoning_efforts, weights=weights, k=1)[0]
 
 
-def build_dataset_subdir(num_samples, enable_thinking: bool) -> str:
-    """Build dataset subdirectory name from data collection features.
+def extract_samples_from_filename(input_file_path: str) -> str:
+    """Extract sample count from input filename.
 
-    Format: n{num_samples|all}_think_{on|off}
     Examples:
-        n50000_think_on
-        nall_think_off
+        nemotron_4000.jsonl -> 4000
+        train_2000.jsonl -> 2000
     """
-    n_str = str(num_samples) if num_samples is not None else "all"
+    import re
+    basename = os.path.basename(input_file_path)
+    match = re.search(r'(\d+)', basename)
+    return match.group(1) if match else "all"
+
+
+def extract_dataset_name(input_file_path: str) -> str:
+    """Extract dataset name from input filename.
+
+    Examples:
+        nemotron_4000.jsonl -> nemotron
+        train_data.jsonl -> train_data
+    """
+    basename = os.path.basename(input_file_path)
+    # Remove extension and any _{number} suffix
+    import re
+    name = re.sub(r'\.jsonl?$', '', basename)
+    name = re.sub(r'_\d+$', '', name)
+    return name
+
+
+def build_output_filename(input_file_path: str, num_samples, enable_thinking: bool, model_name: str) -> str:
+    """Build output filename from data collection features.
+
+    Format: {dataset}_think_{on|off}_samples_{count}_{model}_regen.jsonl
+    Examples:
+        nemotron_think_on_samples_2000_qwen3_8b_regen.jsonl
+        sharegpt_think_off_samples_all_llama3_1_regen.jsonl
+    """
+    dataset_name = extract_dataset_name(input_file_path)
+    # Use explicit num_samples if provided, otherwise extract from filename
+    if num_samples is not None:
+        samples_str = str(num_samples)
+    else:
+        samples_str = extract_samples_from_filename(input_file_path)
     think_str = "on" if enable_thinking else "off"
-    return f"nemotron_n{n_str}_think_{think_str}"
+    # Clean model name (remove path separators)
+    model_name_clean = model_name.replace('/', '_').replace('\\', '_')
+    return f"{dataset_name}_think_{think_str}_samples_{samples_str}_{model_name_clean}_regen.jsonl"
 
 
 def resolve_output_path(args):
     """Resolve the output file path from args.
 
     If --output-file-path is provided, use it directly.
-    Otherwise, auto-generate from --dataset-base-dir, num_samples, and enable_thinking.
+    Otherwise, auto-generate based on input filename, num_samples, enable_thinking, and model.
     """
     if args.output_file_path is not None:
         return args.output_file_path
-    subdir = build_dataset_subdir(args.num_samples, args.enable_thinking)
-    return os.path.join(args.dataset_base_dir, subdir, "train_regen.jsonl")
+    filename = build_output_filename(args.input_file_path, args.num_samples, args.enable_thinking, args.model)
+    return os.path.join("./cache/data/regen_data", filename)
 
 
 def compute_context_length(conversations: List[Dict[str, Any]]) -> int:
@@ -227,8 +258,7 @@ def build_query_kwargs(args, messages, max_tokens=None):
     if args.repetition_penalty is not None:
         query_kwargs["presence_penalty"] = args.repetition_penalty
 
-    # if adding enable_thinking in args, than think mode
-    extra_body = {"chat_template_kwargs": {"enable_thinking": args.enable_thinking}}
+    extra_body = {"chat_template_kwargs": {"enable_thinking": True}}
     
     if args.top_k is not None:
         extra_body["top_k"] = args.top_k
