@@ -87,6 +87,7 @@ def parse_args():
     dataset_group.add_argument("--chat-template", type=str, default="qwen")
     dataset_group.add_argument("--is-preformatted", action="store_true")
     dataset_group.add_argument("--dataloader-num-workers", type=int, default=8)
+    dataset_group.add_argument("--chs-concat-mode", type=str, default="feature")
     dataset_group.add_argument(
         "--build-dataset-num-proc",
         type=int,
@@ -170,6 +171,8 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
 
     if not hasattr(draft_config, "flashmtp_config") or draft_config.flashmtp_config is None:
         draft_config.flashmtp_config = {}
+        
+    draft_config.flashmtp_config["chs_concat_mode"] = args.chs_concat_mode
 
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
@@ -394,7 +397,8 @@ def main():
 
 
     draft_model.mask_token_id = mask_token_id
-    draft_model.config.flashmtp_config["concat_mode"] = args.concat_mode
+    
+    draft_model.config.flashmtp_config["chs_concat_mode"] = args.chs_concat_mode
     draft_model.config.flashmtp_config["mask_token_id"] = mask_token_id
     draft_model.config.flashmtp_config["target_layer_ids"] = draft_model.target_layer_ids
     print_on_rank0(f"flashmtp_config: {draft_model.config.flashmtp_config}")
@@ -414,6 +418,7 @@ def main():
         trust_remote_code=args.trust_remote_code,
     )
 
+    print(f"args.chs_concat_mode:{args.chs_concat_mode}")
     flashmtp_model = OnlineFlashMTPModel(
         draft_model=draft_model,
         target_lm_head=target_components.lm_head,
@@ -423,7 +428,7 @@ def main():
         attention_backend=args.attention_backend,
         num_anchors=args.num_anchors,
         loss_decay_gamma=args.loss_decay_gamma,
-        concat_mode=args.concat_mode,
+        chs_concat_mode=args.chs_concat_mode,
     )
 
     flashmtp_model = FSDP(
@@ -444,9 +449,9 @@ def main():
         warmup_ratio=args.warmup_ratio,
         total_steps=total_steps,
     )
-
-    start_epoch = ckpt_info[0]
-    global_step = ckpt_info[1]
+    skip_steps=0
+    start_epoch = 0
+    global_step = 0
     if resume_state is not None:
         optimizer.scheduler.load_state_dict(resume_state["scheduler_state_dict"])
         start_epoch = resume_state["epoch"]
@@ -454,7 +459,7 @@ def main():
         del resume_state
         print_on_rank0(f"Restored scheduler, lr={optimizer.get_learning_rate():.6f}")
 
-    skip_steps = global_step - start_epoch * len(train_dataloader)
+        skip_steps = global_step - start_epoch * len(train_dataloader)
 
     print_on_rank0(f"Initializing tracker (report_to={args.report_to})...")
     tracker = create_tracker(args, args.output_dir)
@@ -487,7 +492,10 @@ def main():
             target_output = target_model.generate_flashmtp_data(
                 input_ids, attention_mask, loss_mask
             )
-            hidden_states = target_output.hidden_states.cuda()  # Ensure on GPU
+            
+            # 将元组中的每个 tensor 都移动到 GPU
+            hidden_states = tuple(h.cuda() for h in target_output.hidden_states)
+            # hidden_states = target_output.hidden_states.cuda()  # Ensure on GPU
 
             loss, accuracy = flashmtp_model(
                 input_ids=input_ids,

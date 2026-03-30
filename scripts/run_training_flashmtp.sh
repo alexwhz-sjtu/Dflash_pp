@@ -3,6 +3,22 @@
 
 set -e
 
+# 过滤函数：只显示 rank 0 和 rank 1 的输出，以及没有 rank 标识的通用信息
+filter_rank_output() {
+    while IFS= read -r line; do
+        # 检查是否包含 rank 标识
+        if echo "$line" | grep -qE '\[rank[0-9]+\]'; then
+            # 只显示 rank0 或 rank1
+            if echo "$line" | grep -qE '\[rank(0|1|2|3|4|5|6|7)\]'; then
+                echo "$line"
+            fi
+        else
+            # 没有 rank 标识的行，直接显示
+            echo "$line"
+        fi
+    done
+}
+
 # 自动激活虚拟环境
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "${SCRIPT_DIR}")"
@@ -48,7 +64,7 @@ DATA_SUBDIR="n${DATA_NUM_SAMPLES}_think_${THINK_STR}"
 # 数据目录（支持通过 TRAIN_DATA_PATH 直接指定，否则自动构建）
 TRAIN_DATA_PATH="./cache/data/regen_data/nemotron_4000/nemotron_think_on_samples_4000_qwen3_8b_regen.jsonl"
 EVAL_DATA_PATH="${EVAL_DATA_PATH:-}"
-OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/dflash_think_on_qwen3_8b_maxlen${MAX_LENGTH}}"
+OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_think_on_qwen3_8b_maxlen${MAX_LENGTH}}"
 CACHE_DIR="./cache/data/regen_data/nemotron_4000"
 
 # 模型参数
@@ -59,7 +75,7 @@ ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}"
 LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-7}"  # 建议: block_size=16用7, 10用5, 8用4
 
 # 日志和保存间隔
-LOG_INTERVAL="${LOG_INTERVAL:-50}"
+LOG_INTERVAL="${LOG_INTERVAL:-100}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-1000}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-1000}"
 
@@ -78,6 +94,8 @@ IS_PREFORMATTED="${IS_PREFORMATTED:-}"
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-8}"
 BUILD_DATASET_NUM_PROC="${BUILD_DATASET_NUM_PROC:-8}"
 
+CHS_CONCAT_MODE="${CHS_CONCAT_MODE:-feature}"
+
 # 恢复训练
 RESUME="${RESUME:-}"
 CKPT_DIR="${CKPT_DIR:-}"
@@ -86,7 +104,7 @@ CKPT_DIR="${CKPT_DIR:-}"
 # 显示配置
 # ========================================
 echo "=========================================="
-echo "DFlash 训练启动脚本"
+echo "FlashMTP 训练启动脚本"
 echo "=========================================="
 echo "数据特征:"
 echo "  样本数量: ${DATA_NUM_SAMPLES}"
@@ -132,7 +150,7 @@ mkdir -p ${CACHE_DIR}
 # 训练
 # ========================================
 echo ""
-echo "==> 开始训练 DFlash"
+echo "==> 开始训练 FlashMTP"
 echo ""
 
 if [ "${NPROC_PER_NODE}" -gt 1 ]; then
@@ -174,7 +192,9 @@ if [ "${REPORT_TO}" != "none" ]; then
     fi
 fi
 
-"${LAUNCHER[@]}"    ./scripts/train_dflash.py \
+# 运行训练并通过过滤器输出
+EXIT_CODE=0
+"${LAUNCHER[@]}"    ./scripts/train_flashmtp.py \
     --target-model-path ${TARGET_MODEL} \
     --target-model-backend ${TARGET_MODEL_BACKEND} \
     --train-data-path "${TRAIN_DATA_PATH}" \
@@ -199,8 +219,18 @@ fi
     --build-dataset-num-proc ${BUILD_DATASET_NUM_PROC} \
     --tp-size ${TP_SIZE} \
     --dist-timeout ${DIST_TIMEOUT} \
+    --chs-concat-mode ${CHS_CONCAT_MODE} \
     --seed 42 \
-    ${OPTIONAL_ARGS}
+    ${OPTIONAL_ARGS} 2>&1 | filter_rank_output || EXIT_CODE=$?
+
+# 检查训练是否成功
+if [ $EXIT_CODE -ne 0 ]; then
+    echo ""
+    echo "=========================================="
+    echo "训练失败 (退出码: $EXIT_CODE)"
+    echo "=========================================="
+    exit $EXIT_CODE
+fi
 
 # ========================================
 # 训练完成

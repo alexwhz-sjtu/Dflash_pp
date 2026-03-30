@@ -101,8 +101,6 @@ class Qwen3FlashMTPAttention(nn.Module):
         q = self.q_norm(q).transpose(1, 2)
         k_ctx = self.k_proj(target_hidden)
 
-        assert ctx_len==1, f"Expected k_ctx sequence length 1, got {ctx_len}"
-
         k_noise = self.k_proj(hidden_states)
         v_ctx = self.v_proj(target_hidden)
         v_noise = self.v_proj(hidden_states)
@@ -232,7 +230,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.block_size = config.block_size
         self.mask_token_id = flashmtp_config.get("mask_token_id", None)
-        self.chs_concat_mode = flashmtp_config.get("concat_mode", "seq")
+        self.chs_concat_mode = flashmtp_config.get("chs_concat_mode", "seq")
 
         # For seq concat mode: use Identity (no computation, no parameters)
         # For feature mode: use Linear projection and RMSNorm
@@ -246,9 +244,8 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         else:
             self.fc = nn.Identity()
             self.hidden_norm = nn.Identity()
+        print(f"self.chs_concat_mode: {self.chs_concat_mode}")
 
-        print(f"CHS Concat Mode: {self.chs_concat_mode}")
-        print(f"Target Layer IDs: {self.target_layer_ids}")
         self.post_init()
 
     def forward(
