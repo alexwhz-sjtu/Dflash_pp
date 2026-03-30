@@ -128,7 +128,7 @@ class SGLangFlashMTPTargetModel(FlashMTPTargetModel):
         super().set_capture_layers(layer_ids)
         if hasattr(self.model_runner.model, "set_eagle3_layers_to_capture"):
             self.model_runner.model.set_eagle3_layers_to_capture(layer_ids)
-            print(f"FlashMTP: Capturing layers {self.model_runner.model.model.layers_to_capture}")
+
 
     @torch.no_grad
     def _extend(self, reqs):

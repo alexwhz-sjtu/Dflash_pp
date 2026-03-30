@@ -5,6 +5,7 @@ from torch import nn
 from transformers import DynamicCache
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import CausalLMOutputWithPast
+from ...utils import print_on_rank0
 from transformers.models.qwen3.modeling_qwen3 import (
     ALL_ATTENTION_FUNCTIONS,
     FlashAttentionKwargs,
@@ -230,7 +231,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.block_size = config.block_size
         self.mask_token_id = flashmtp_config.get("mask_token_id", None)
-        self.chs_concat_mode = flashmtp_config.get("concat_mode", "seq")
+        self.chs_concat_mode = flashmtp_config.get("chs_concat_mode", "seq")
 
         # For seq concat mode: use Identity (no computation, no parameters)
         # For feature mode: use Linear projection and RMSNorm
@@ -244,9 +245,8 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         else:
             self.fc = nn.Identity()
             self.hidden_norm = nn.Identity()
+        print_on_rank0(f"self.chs_concat_mode: {self.chs_concat_mode}")
 
-        print(f"CHS Concat Mode: {self.chs_concat_mode}")
-        print(f"Target Layer IDs: {self.target_layer_ids}")
         self.post_init()
 
     def forward(
