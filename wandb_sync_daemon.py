@@ -15,7 +15,7 @@ from pathlib import Path
 
 # ==================== 配置区域 ====================
 # wandb 离线日志目录
-WANDB_DIR = "./wandb/offline-run-20260330_054134-zv8t8c2a"
+WANDB_DIR = "/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/wandb/offline-run-20260330_093013-y36m03gw"
 
 # wandb project 名称
 WANDB_PROJECT = "flashmtp_training"

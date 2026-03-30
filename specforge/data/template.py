@@ -201,7 +201,6 @@ TEMPLATE_REGISTRY.register(
     ),
 )
 
-
 TEMPLATE_REGISTRY.register(
     name="qwen3-instruct",
     template=ChatTemplate(

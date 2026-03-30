@@ -33,7 +33,7 @@ WARMUP_RATIO="${WARMUP_RATIO:-0.04}"
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 
 # 数据特征参数（用于自动构建数据路径）
-DATA_NUM_SAMPLES="${DATA_NUM_SAMPLES:-4000}"
+DATA_NUM_SAMPLES="${DATA_NUM_SAMPLES:-40000}"
 ENABLE_THINKING="${ENABLE_THINKING:-on}"
 
 # 构建数据子目录名: n{N|all}_think_{on|off}
@@ -46,10 +46,10 @@ fi
 DATA_SUBDIR="n${DATA_NUM_SAMPLES}_think_${THINK_STR}"
 
 # 数据目录（支持通过 TRAIN_DATA_PATH 直接指定，否则自动构建）
-TRAIN_DATA_PATH="./cache/data/regen_data/nemotron_4000/nemotron_think_on_samples_4000_qwen3_8b_regen.jsonl"
+TRAIN_DATA_PATH="./cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
 EVAL_DATA_PATH="${EVAL_DATA_PATH:-}"
-OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/dflash_think_on_qwen3_8b_maxlen${MAX_LENGTH}}"
-CACHE_DIR="./cache/data/regen_data/nemotron_4000"
+OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/dflash_sample_40000_think_on_qwen3_8b_maxlen${MAX_LENGTH}}"
+CACHE_DIR="./cache/data/regen_data/nemotron_40000"
 
 # 模型参数
 NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"
@@ -60,27 +60,26 @@ LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-7}"  # 建议: block_size=16用7, 10用5, 
 
 # 日志和保存间隔
 LOG_INTERVAL="${LOG_INTERVAL:-50}"
-SAVE_INTERVAL="${SAVE_INTERVAL:-1000}"
-EVAL_INTERVAL="${EVAL_INTERVAL:-1000}"
+SAVE_INTERVAL="${SAVE_INTERVAL:-10000}"
+EVAL_INTERVAL="${EVAL_INTERVAL:-10000}"
 
 # Tracker 参数
 REPORT_TO="${REPORT_TO:-wandb}"  # none, wandb, tensorboard
 WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training}"
 WANDB_RUN_NAME="${WANDB_RUN_NAME:-}"
+WANDB_DIR="${WANDB_DIR:-./wandb}"  # 离线日志保存目录
+WANDB_RUN_ID="${WANDB_RUN_ID:-dflash_40000}"   # 离线子目录名称 (如: my_run_001，生成 offline-run-my_run_001)
 
 # 分布式参数
 TP_SIZE="${TP_SIZE:-1}"
 DIST_TIMEOUT="${DIST_TIMEOUT:-30}"
 
 # 数据参数
-CHAT_TEMPLATE="${CHAT_TEMPLATE:-qwen}"
+CHAT_TEMPLATE="${CHAT_TEMPLATE:-qwen3-thinking}"
 IS_PREFORMATTED="${IS_PREFORMATTED:-}"
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-8}"
 BUILD_DATASET_NUM_PROC="${BUILD_DATASET_NUM_PROC:-8}"
 
-# 恢复训练
-RESUME="${RESUME:-}"
-CKPT_DIR="${CKPT_DIR:-}"
 
 # ========================================
 # 显示配置
@@ -123,6 +122,17 @@ echo "------------------------------------------"
 echo "Tracker: ${REPORT_TO}"
 echo "=========================================="
 echo ""
+
+# 如果输出目录已存在，自动添加数字后缀
+original_output_dir="${OUTPUT_DIR}"
+suffix=1
+while [ -d "${OUTPUT_DIR}" ] && [ -n "$(ls -A "${OUTPUT_DIR}" 2>/dev/null)" ]; do
+    OUTPUT_DIR="${original_output_dir}_${suffix}"
+    suffix=$((suffix + 1))
+done
+if [ "${OUTPUT_DIR}" != "${original_output_dir}" ]; then
+    echo "警告: 输出目录 ${original_output_dir} 已存在且非空，自动切换到: ${OUTPUT_DIR}"
+fi
 
 # 创建输出目录
 mkdir -p ${OUTPUT_DIR}

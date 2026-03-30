@@ -5,6 +5,7 @@ from torch import nn
 from transformers import DynamicCache
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import CausalLMOutputWithPast
+from ...utils import print_on_rank0
 from transformers.models.qwen3.modeling_qwen3 import (
     ALL_ATTENTION_FUNCTIONS,
     FlashAttentionKwargs,
@@ -244,7 +245,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         else:
             self.fc = nn.Identity()
             self.hidden_norm = nn.Identity()
-        print(f"self.chs_concat_mode: {self.chs_concat_mode}")
+        print_on_rank0(f"self.chs_concat_mode: {self.chs_concat_mode}")
 
         self.post_init()
 

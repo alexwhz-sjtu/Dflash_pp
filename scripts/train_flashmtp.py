@@ -418,7 +418,6 @@ def main():
         trust_remote_code=args.trust_remote_code,
     )
 
-    print(f"args.chs_concat_mode:{args.chs_concat_mode}")
     flashmtp_model = OnlineFlashMTPModel(
         draft_model=draft_model,
         target_lm_head=target_components.lm_head,
