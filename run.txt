@@ -84,6 +84,7 @@ python scripts/regenerate_train_data.py \
     --temperature 0.0 \
     --input-file-path ./cache/data/sampled_ori/nemotron_400000.jsonl \
     --max-tokens 32768 \
+    --resume \
     --enable-thinking \
     --output-file-path ./cache/data/regen_data/nemotron_400000/nemotron_think_on_samples_400000_qwen3_8b_regen.jsonl
 
