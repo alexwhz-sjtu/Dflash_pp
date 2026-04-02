@@ -218,6 +218,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
     def __init__(self, config) -> None:
         super().__init__(config)
         self.config = config
+        flashmtp_config = getattr(config, "flashmtp_config", {}) or {}
         self.chs_concat_mode = flashmtp_config.get("chs_concat_mode", "seq")
         self.layers = nn.ModuleList(
             [
@@ -225,7 +226,6 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
-        flashmtp_config = getattr(config, "flashmtp_config", {}) or {}
         # target_layer_ids: list of layer indices to extract from target model
         self.target_layer_ids = flashmtp_config.get(
             "target_layer_ids",
@@ -267,6 +267,7 @@ class FlashMTPDraftModel(Qwen3PreTrainedModel):
         
         hidden_states = noise_embedding
         target_hidden = self.hidden_norm(self.fc(target_hidden))
+        # position_embeddings = self.rotary_emb(torch.cat([target_hidden, hidden_states], dim=1), position_ids)
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         for layer in self.layers:
             hidden_states = layer(
