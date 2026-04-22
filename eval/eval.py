@@ -4,6 +4,8 @@ import sys
 import importlib.util
 
 _REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_TRUNCK_DIR = os.path.join(_REPO, "eval", "trunck")
+_DEFAULT_TRUNC_PROFILE_DRAFT_TOPK = os.path.join(_TRUNCK_DIR, "draft_topk.jsonl")
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
@@ -190,6 +192,14 @@ def multi_turn_dialogue(
             log_file.write(
                 f"  inner_kt_rounds (每验证步各轮 k): {stats.get('inner_kt_rounds', [])}\n"
             )
+            if stats.get("record_posthoc_suffix_refine"):
+                log_file.write(
+                    f"  posthoc_suffix_refine: mean_gain_corrected="
+                    f"{stats.get('mean_posthoc_suffix_accept_gain_corrected', stats.get('mean_posthoc_suffix_accept_gain', 0)):.4f} | "
+                    f"executed={stats.get('n_posthoc_suffix_refine_executed', stats.get('n_posthoc_suffix_events', 0))} | "
+                    f"skipped_anchor_only={stats.get('n_posthoc_suffix_skipped_anchor_only', 0)} | "
+                    f"target_extra_s={stats.get('target_posthoc_extra_time', 0):.4f}\n"
+                )
             log_file.write(
                 f"  Target Time: {stats['target_total_time']:.4f}s | "
                 f"Draft Time: {stats['draft_total_time']:.4f}s\n"
@@ -213,6 +223,11 @@ def summarize_question_stats(turn_stats, responses=None):
     calib_rates = []
     mean_inner_iters_list = []
     all_inner_kt_rounds = []
+    posthoc_gains_flat: List[float] = []
+    posthoc_pairs_flat: List[List[float]] = []
+    posthoc_skipped_anchor_total = 0
+    posthoc_executed_total = 0
+    target_posthoc_extra = 0.0
 
     for one_turn in turn_stats:
         all_accept_lengths.extend(one_turn.get("accept_lengths", []))
@@ -229,6 +244,19 @@ def summarize_question_stats(turn_stats, responses=None):
         mean_inner_iters_list.append(float(one_turn.get("mean_inner_iters", 0.0)))
         for rnd in one_turn.get("inner_kt_rounds", []):
             all_inner_kt_rounds.append(rnd)
+        for g in one_turn.get("posthoc_suffix_refine_gains", []):
+            if g is not None:
+                posthoc_gains_flat.append(float(g))
+        for pair in one_turn.get("posthoc_suffix_refine_pairs", []):
+            if isinstance(pair, (list, tuple)) and len(pair) >= 2:
+                posthoc_pairs_flat.append([float(pair[0]), float(pair[1])])
+        posthoc_skipped_anchor_total += int(
+            one_turn.get("n_posthoc_suffix_skipped_anchor_only", 0)
+        )
+        posthoc_executed_total += int(
+            one_turn.get("n_posthoc_suffix_refine_executed", 0)
+        )
+        target_posthoc_extra += float(one_turn.get("target_posthoc_extra_time", 0.0))
 
     mean_accept = float(np.mean(all_accept_lengths)) if all_accept_lengths else 0.0
     mean_response_length = float(np.mean(response_lengths)) if response_lengths else 0.0
@@ -258,6 +286,12 @@ def summarize_question_stats(turn_stats, responses=None):
     thr = overall_throughput
     composite = thr * (0.2 + 0.8 * calib) if total_time > 0 else 0.0
 
+    mean_posthoc_gain_corrected = (
+        float(np.mean([p[1] for p in posthoc_pairs_flat]))
+        if posthoc_pairs_flat
+        else 0.0
+    )
+
     return {
         "all_accept_lengths": all_accept_lengths,
         "mean_accept_length": mean_accept,
@@ -277,6 +311,14 @@ def summarize_question_stats(turn_stats, responses=None):
         "mean_inner_iters_reported": mean_inner_iters,
         "num_blocks_with_round2_plus": len(second_plus_all),
         "objective_composite": composite,
+        "mean_posthoc_suffix_accept_gain": mean_posthoc_gain_corrected,
+        "mean_posthoc_suffix_accept_gain_corrected": mean_posthoc_gain_corrected,
+        "posthoc_suffix_gain_values": posthoc_gains_flat,
+        "posthoc_suffix_refine_pairs": posthoc_pairs_flat,
+        "n_posthoc_suffix_refine_executed": posthoc_executed_total,
+        "n_posthoc_suffix_skipped_anchor_only": posthoc_skipped_anchor_total,
+        "n_posthoc_suffix_events": len(posthoc_pairs_flat),
+        "target_posthoc_extra_time": target_posthoc_extra,
     }
 
 
@@ -365,7 +407,18 @@ def main():
     parser.add_argument("--debug-dir", type=str, default="./debug")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--thinking", action="store_true")
-    parser.add_argument("--draft-topk-file", type=str, default=None)
+    parser.add_argument(
+        "--draft-topk-file",
+        type=str,
+        default=None,
+        help="draft top-k 行日志路径；默认关闭。截断 profile 建议 eval/trunck/draft_topk.jsonl，"
+        "或与 --emit-trunc-profile 联用自动使用该路径。",
+    )
+    parser.add_argument(
+        "--emit-trunc-profile",
+        action="store_true",
+        help=f"写入截断 profile 的 draft_topk 到 {_DEFAULT_TRUNC_PROFILE_DRAFT_TOPK}（若未再指定 --draft-topk-file）",
+    )
     parser.add_argument("--draft-topk", type=int, default=2)
     parser.add_argument(
         "--max-block-inner-iters",
@@ -432,7 +485,19 @@ def main():
         default=None,
         help="非 grid 模式下，将全部 turn 的汇总指标写入该路径",
     )
+    parser.add_argument(
+        "--record-posthoc-suffix-refine",
+        action="store_true",
+        help="后验实验：每验证步在已知 target 接受前缀后，对后缀再草稿一次并二次验证，"
+        "统计 accept 长度增量（不改变真实解码轨迹；额外 target 计入手动字段）。",
+    )
     args = parser.parse_args()
+
+    if args.emit_trunc_profile and not args.draft_topk_file:
+        args.draft_topk_file = _DEFAULT_TRUNC_PROFILE_DRAFT_TOPK
+
+    if args.grid_truncation and args.output_dir == "./model_answer":
+        args.output_dir = os.path.join(_TRUNCK_DIR, "grid_run")
 
     if args.target_model_path is None:
         args.target_model_path = MODEL_PAIRS[args.model_pair]["target"]
@@ -482,6 +547,7 @@ def main():
         "inner_fallback": args.inner_fallback,
         "use_draft_tree": args.use_draft_tree,
         "draft_tree_branches": args.draft_tree_branches,
+        "record_posthoc_suffix_refine": bool(args.record_posthoc_suffix_refine),
     }
     if args.spec_json:
         with open(args.spec_json, "r", encoding="utf-8") as sf:

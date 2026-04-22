@@ -18,6 +18,7 @@ DEFAULT_QUESTION = (
     "/share/wanghanzhen/SpeculativeDecoding/NIPS26/dataset/mtbench101/question.jsonl"
 )
 OUT = REPO / "eval" / "_til_out"
+TRUNCK = REPO / "eval" / "trunck"
 
 
 def _run(cmd: list[str], cwd: Path | None = None) -> None:
@@ -79,7 +80,8 @@ def main() -> None:
         report["phases"].append({"name": "smoke", "summary_path": str(summ_path)})
 
     if not args.skip_grid:
-        grid_dir = OUT / "grid_fast"
+        TRUNCK.mkdir(parents=True, exist_ok=True)
+        grid_dir = TRUNCK / "grid_fast"
         grid_dir.mkdir(parents=True, exist_ok=True)
         grid_json = grid_dir / "grid_truncation_results.json"
         _run(
@@ -111,13 +113,13 @@ def main() -> None:
             {"name": "grid_fast_no_tree", "path": str(grid_json), "n": len(grid_rows)}
         )
         best_cfg = dict(grid_rows[0]["config"])
-        best_line_path = OUT / "best_line_spec.json"
+        best_line_path = TRUNCK / "best_line_spec.json"
         best_line_path.write_text(
             json.dumps(best_cfg, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         report["best_line_spec"] = best_cfg
     else:
-        best_line_path = OUT / "best_line_spec.json"
+        best_line_path = TRUNCK / "best_line_spec.json"
         if not best_line_path.is_file():
             print("缺少 best_line_spec.json，请先跑网格或去掉 --skip-grid", file=sys.stderr)
             sys.exit(1)
@@ -155,7 +157,7 @@ def main() -> None:
         )
         tree_cfg = dict(best_cfg)
         tree_cfg["use_draft_tree"] = True
-        tree_spec_path = OUT / "best_tree_spec.json"
+        tree_spec_path = TRUNCK / "best_tree_spec.json"
         tree_spec_path.write_text(
             json.dumps(tree_cfg, ensure_ascii=False, indent=2), encoding="utf-8"
         )

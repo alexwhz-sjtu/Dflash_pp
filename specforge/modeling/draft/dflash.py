@@ -1,3 +1,4 @@
+import copy
 import json
 import time
 from typing import Any, Callable, Dict, List, Optional
@@ -493,8 +494,18 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         tokenizer=None,
         draft_topk_file=None,
         draft_topk: int = 2,
+        calibration_records: Optional[List[Dict[str, Any]]] = None,
+        record_posthoc_suffix_refine: bool = False,
     ):
-        """Speculative generation with optional DFlash++ in-block iteration and draft tree."""
+        """Speculative generation with optional DFlash++ in-block iteration and draft tree.
+
+        When ``record_posthoc_suffix_refine`` is True (no draft tree), after each target verify
+        we measure a counterfactual: freeze the accepted prefix, remask the suffix, run one
+        draft forward to refill the tail, target-verify again, and record accept-length gain.
+        Steps with accept length 1 (only block index 0) are skipped: same draft input as the
+        first refine round, so no extra information. KV caches are snapshot/restored so the
+        real decode path is unchanged.
+        """
         self.eval()
         max_block_inner_iters = max(1, min(3, int(max_block_inner_iters)))
         t_target = 0.0
@@ -508,6 +519,10 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         trunc_calib_hits: List[int] = []
         second_plus_kt_sum: List[int] = []
         tree_branch_picks: List[int] = []
+        posthoc_suffix_refine_gains: List[Optional[int]] = []
+        posthoc_suffix_refine_pairs: List[List[int]] = []
+        posthoc_suffix_skipped_anchor_only = 0
+        t_target_posthoc_extra = 0.0
 
         device = target.device
         num_input_tokens = input_ids.shape[1]
@@ -516,6 +531,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         mask_id = self.mask_token_id
 
         self._draft_topk_seq = 0
+        self._calibration_pending: Optional[Dict[str, Any]] = None
         if draft_topk_file is not None and tokenizer is not None:
             self._draft_topk_file = draft_topk_file
             self._draft_topk_tokenizer = tokenizer
@@ -598,6 +614,23 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 logits_suf = full_lm[0, num_confirmed:block_size, :]
                 if logits_suf.shape[0] == 0:
                     break
+                if (
+                    calibration_records is not None
+                    and inner_used == 0
+                    and init_confirmed == 1
+                    and not use_draft_tree
+                ):
+                    pm, mg, et = _suffix_metrics(logits_suf)
+                    probs_suf = torch.softmax(logits_suf.float(), dim=-1)
+                    t2v, t2i = torch.topk(probs_suf, min(2, probs_suf.shape[-1]), dim=-1)
+                    self._calibration_pending = {
+                        "pmax": pm.detach().cpu().tolist(),
+                        "margin": mg.detach().cpu().tolist(),
+                        "ent": et.detach().cpu().tolist(),
+                        "top2_prob": t2v.detach().cpu().tolist(),
+                        "top2_token_id": t2i.detach().cpu().tolist(),
+                        "num_confirmed_start": int(num_confirmed),
+                    }
                 pred_suf = torch.argmax(logits_suf, dim=-1)
                 trunc_pol = "full" if policy == "full" else policy
                 k = _truncate_suffix_length(
@@ -755,6 +788,13 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 second_plus_kt_sum.append(int(sum(k_list[1:])))
             commit_lens_pre_verify.append(int(commit_len))
 
+            snap_t_before: Optional[DynamicCache] = None
+            snap_t_after_first: Optional[DynamicCache] = None
+            snap_d_after_refine: Optional[DynamicCache] = None
+            if record_posthoc_suffix_refine and not use_draft_tree:
+                snap_t_before = copy.deepcopy(past_key_values_target)
+                snap_d_after_refine = copy.deepcopy(past_key_values_draft)
+
             t0 = time.perf_counter()
             output = target(
                 block_output_ids,
@@ -767,6 +807,9 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 torch.cuda.synchronize()
             t_target += time.perf_counter() - t0
 
+            if record_posthoc_suffix_refine and not use_draft_tree:
+                snap_t_after_first = copy.deepcopy(past_key_values_target)
+
             posterior = sample(output.logits, temperature)
             acceptance_length = (
                 (block_output_ids[:, 1:] == posterior[:, :-1])
@@ -775,6 +818,77 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 .item()
             )
             accept_lens_actual.append(int(acceptance_length + 1))
+
+            posthoc_gain_block: Optional[int] = None
+            _acc1 = int(acceptance_length + 1)
+            if (
+                record_posthoc_suffix_refine
+                and not use_draft_tree
+                and _acc1 < block_size
+                and _acc1 <= 1
+            ):
+                posthoc_suffix_skipped_anchor_only += 1
+            # acc1==1 时仅块内位置 0 被接受，与首轮 refine 的「仅确认块首、后缀全 mask」相同；
+            # 同条件 target_hidden/KV 下二次 suffix 草稿与首轮等价（greedy 下无新信息），跳过。
+            if (
+                record_posthoc_suffix_refine
+                and not use_draft_tree
+                and snap_t_before is not None
+                and snap_t_after_first is not None
+                and snap_d_after_refine is not None
+                and _acc1 < block_size
+                and _acc1 > 1
+            ):
+                past_key_values_target = copy.deepcopy(snap_t_before)
+                past_key_values_draft = copy.deepcopy(snap_d_after_refine)
+                b2 = block_output_ids.clone()
+                b2[:, _acc1:] = mask_id
+                t_d = time.perf_counter()
+                full_lm_ph = self._draft_forward_block_logits(
+                    target,
+                    b2,
+                    target_hidden,
+                    position_ids,
+                    past_key_values_draft,
+                    start,
+                    block_size,
+                    topk_meta={
+                        "stage": "posthoc_suffix_refine",
+                        "frozen_prefix_len": _acc1,
+                    },
+                )
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                t_draft += time.perf_counter() - t_d
+                logits_tail = full_lm_ph[0, _acc1:block_size, :]
+                if logits_tail.shape[0] > 0:
+                    pred_tail = torch.argmax(logits_tail, dim=-1)
+                    b2[:, _acc1:block_size] = pred_tail.unsqueeze(0)
+                t0_ph = time.perf_counter()
+                output_ph = target(
+                    b2,
+                    position_ids=block_position_ids,
+                    past_key_values=past_key_values_target,
+                    use_cache=True,
+                    output_hidden_states=True,
+                )
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                dt_ph = time.perf_counter() - t0_ph
+                t_target_posthoc_extra += dt_ph
+                posterior_ph = sample(output_ph.logits, temperature)
+                al2 = (
+                    (b2[:, 1:] == posterior_ph[:, :-1])
+                    .cumprod(dim=1)
+                    .sum(dim=1)[0]
+                    .item()
+                )
+                acc2 = int(al2 + 1)
+                posthoc_gain_block = int(acc2 - _acc1)
+                posthoc_suffix_refine_pairs.append([_acc1, posthoc_gain_block])
+                past_key_values_target = copy.deepcopy(snap_t_after_first)
+                past_key_values_draft = copy.deepcopy(snap_d_after_refine)
+            posthoc_suffix_refine_gains.append(posthoc_gain_block)
             trunc_calib_hits.append(
                 1 if commit_len <= acceptance_length + 1 else 0
             )
@@ -784,6 +898,13 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             self._emit_draft_profile_target_accept(
                 _n_acc, int(commit_len), _acc_ids, _corr
             )
+            if calibration_records is not None and self._calibration_pending is not None:
+                row = dict(self._calibration_pending)
+                row["accept_len"] = _n_acc
+                row["verify_step"] = int(steps)
+                row["block_start_abs"] = int(start)
+                calibration_records.append(row)
+                self._calibration_pending = None
 
             output_ids[:, start : start + acceptance_length + 1] = block_output_ids[
                 :, : acceptance_length + 1
@@ -823,6 +944,11 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             if trunc_calib_hits
             else 0.0
         )
+        gains_only = [g for g in posthoc_suffix_refine_gains if g is not None]
+        gains_from_pairs = [int(p[1]) for p in posthoc_suffix_refine_pairs]
+        mean_posthoc_gain_corrected = (
+            _mean_int(gains_from_pairs) if gains_from_pairs else 0.0
+        )
 
         self._last_decode_stats = {
             "accept_lengths": acceptance_lengths,
@@ -842,7 +968,17 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             "truncation_policy": truncation_policy,
             "trunc_tau": trunc_tau,
             "use_draft_tree": use_draft_tree,
+            "record_posthoc_suffix_refine": record_posthoc_suffix_refine,
+            "posthoc_suffix_refine_gains": posthoc_suffix_refine_gains,
+            "posthoc_suffix_refine_pairs": posthoc_suffix_refine_pairs,
+            "mean_posthoc_suffix_accept_gain": mean_posthoc_gain_corrected,
+            "mean_posthoc_suffix_accept_gain_corrected": mean_posthoc_gain_corrected,
+            "n_posthoc_suffix_refine_executed": len(posthoc_suffix_refine_pairs),
+            "n_posthoc_suffix_skipped_anchor_only": posthoc_suffix_skipped_anchor_only,
+            "n_posthoc_suffix_events": len(gains_only),
+            "target_posthoc_extra_time": t_target_posthoc_extra,
         }
         self._draft_topk_file = None
         self._draft_topk_tokenizer = None
+        self._calibration_pending = None
         return output_ids
