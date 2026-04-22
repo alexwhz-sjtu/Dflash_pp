@@ -5,11 +5,6 @@ from .eagle3_target_model import (
     SGLangEagle3TargetModel,
     get_eagle3_target_model,
 )
-from .flashmtp_target_model import (
-    FlashMTPTargetModel,
-    HFFlashMTPTargetModel,
-    get_flashmtp_target_model,
-)
 from .target_head import TargetHead
 
 __all__ = [
@@ -18,8 +13,5 @@ __all__ = [
     "HFEagle3TargetModel",
     "CustomEagle3TargetModel",
     "get_eagle3_target_model",
-    "FlashMTPTargetModel",
-    "HFFlashMTPTargetModel",
-    "get_flashmtp_target_model",
     "TargetHead",
 ]

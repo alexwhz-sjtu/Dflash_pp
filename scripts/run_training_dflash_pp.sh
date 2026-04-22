@@ -1,100 +1,147 @@
 #!/bin/bash
-# DFlash 训练启动脚本
+# DFlash++ 训练启动脚本（与 run_training_dflash.sh 对齐，入口为 train_dflash_pp.py）
 
 set -e
 
-# 自动激活虚拟环境
+DT="a800"
+# posttraining：从 DFlash 权重继续训，默认较低学习率；scratch：从零训练，沿用原较大学习率
+MODE="posttraining"
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --dt) DT="$2"; shift 2 ;;
+        --mode) MODE="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+if [[ "$DT" != "qz" && "$DT" != "a800" ]]; then
+    echo "错误: --dt 须为 qz 或 a800"
+    exit 1
+fi
+if [[ "$MODE" != "posttraining" && "$MODE" != "scratch" ]]; then
+    echo "错误: --mode 须为 posttraining 或 scratch"
+    exit 1
+fi
+
+# a800：更保守锚点数，减轻显存峰值
+if [ "$DT" = "a800" ]; then
+    MAX_LENGTH="${MAX_LENGTH:-4096}"
+    NUM_ANCHORS="${NUM_ANCHORS:-512}"
+else
+    MAX_LENGTH="${MAX_LENGTH:-4096}"
+    NUM_ANCHORS="${NUM_ANCHORS:-512}"
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "${SCRIPT_DIR}")"
 if [ -f "${PROJECT_DIR}/.venv/bin/activate" ]; then
     source "${PROJECT_DIR}/.venv/bin/activate"
 fi
 
+
 # ========================================
 # 主要训练参数
 # ========================================
+
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+MASTER_PORT="${MASTER_PORT:-29502}"
 
 NUM_EPOCHS="${NUM_EPOCHS:-6}"
+BATCH_SIZE="${BATCH_SIZE:-1}"
+ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-1}"
+# 按模式默认学习率（仍可用环境变量 LEARNING_RATE 覆盖）
+if [ "$MODE" = "scratch" ]; then
+    LEARNING_RATE="${LEARNING_RATE:-6e-4}"
+else
+    LEARNING_RATE="${LEARNING_RATE:-3e-4}"
+fi
 MAX_LENGTH="${MAX_LENGTH:-4096}"
-CHS_CONCAT_MODE="${CHS_CONCAT_MODE:-feature}"
-NUM_ANCHORS="${NUM_ANCHORS:-512}"
+WARMUP_RATIO="${WARMUP_RATIO:-0.04}"
+MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 
-# 恢复训练
-RESUME="${RESUME:-}"
-CKPT_DIR="${CKPT_DIR:-}"
 
 # ========================================
 # 主要数据集参数
 # ========================================
-# 数据特征参数
-DATA_NUM_SAMPLES="${DATA_NUM_SAMPLES:-400000}"
+DATA_NUM_SAMPLES="${DATA_NUM_SAMPLES:-40000}"
 ENABLE_THINKING="${ENABLE_THINKING:-on}"
+DATASET_BASE_DIR="${DATASET_BASE_DIR:-./cache/dataset}"
+if [ "${ENABLE_THINKING}" = "on" ] || [ "${ENABLE_THINKING}" = "true" ] || [ "${ENABLE_THINKING}" = "1" ]; then
+    THINK_STR="on"
+else
+    THINK_STR="off"
+fi
+DATA_SUBDIR="n${DATA_NUM_SAMPLES}_think_${THINK_STR}"
 
-# ========================================
-# 默认参数（通常不需要修改）
-# ========================================
 
-# GPU 设置
-MASTER_PORT="${MASTER_PORT:-29501}"
-TP_SIZE="${TP_SIZE:-1}"
-DIST_TIMEOUT="${DIST_TIMEOUT:-3600}"
-
-# 目标模型路径
-TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
-TARGET_MODEL_BACKEND="${TARGET_MODEL_BACKEND:-hf}"
-
-# 训练参数
-BATCH_SIZE="${BATCH_SIZE:-1}"
-ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-1}"
-LEARNING_RATE="${LEARNING_RATE:-6e-4}"
-WARMUP_RATIO="${WARMUP_RATIO:-0.04}"
-MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
-
-# 数据目录
-TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_400000_len_4096/nemotron_think_400000_train_regen.jsonl}"
-
-# TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
 EVAL_DATA_PATH="${EVAL_DATA_PATH:-}"
-OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_${CHS_CONCAT_MODE}_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}}"
 CACHE_DIR="${CACHE_DIR:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}}"
 
-# 模型参数
 NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
+NUM_ANCHORS="${NUM_ANCHORS:-512}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}"
 LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-7}"
 
-# 日志和保存间隔
-LOG_INTERVAL="${LOG_INTERVAL:-50}"
-SAVE_INTERVAL="${SAVE_INTERVAL:-5000}"
-EVAL_INTERVAL="${EVAL_INTERVAL:-5000}"
+# DFlash++：总损失 = μ*L_dflash + λ*L_con；前缀 p 采样 logits_p = -w*(p-1-b)^2
+DFLASH_LOSS_WEIGHT="${DFLASH_LOSS_WEIGHT:-1.0}"
+COMPLETION_LOSS_WEIGHT="${COMPLETION_LOSS_WEIGHT:-0.8}"
+COMPLETION_GAMMA="${COMPLETION_GAMMA:-7}"
+COMPLETION_PREFIX_SAMPLE_WEIGHT="${COMPLETION_PREFIX_SAMPLE_WEIGHT:-0.1}"
+COMPLETION_PREFIX_SAMPLE_BIAS="${COMPLETION_PREFIX_SAMPLE_BIAS:-0.0}"
 
-# Tracker 参数
+# 默认不做「训练集前 N 条」eval；单独评估请设 EVAL_DATA_PATH。若需恢复可 export EVAL_TRAIN_MAX_SAMPLES>0
+EVAL_TRAIN_MAX_SAMPLES="${EVAL_TRAIN_MAX_SAMPLES:-0}"
+EVAL_MAX_BATCHES="${EVAL_MAX_BATCHES:-32}"
+
+# ========================================
+# 主要路径
+# ========================================
+if [ "$DT" = "qz" ]; then
+    TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/DFlash_pp_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
+    TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
+else
+    TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
+    OUTPUT_DIR="./cache/models/flashmtp_v3.1_nemotron_think_on_samples_40000_qwen3_8b"
+    TARGET_MODEL="${TARGET_MODEL:-/share/public/public_models/Qwen3-8B}"
+    # scratch 默认不加载 DFlash；posttraining 默认加载预训练 DFlash 草稿
+    if [ "$MODE" = "posttraining" ]; then
+        INIT_DRAFT_FROM="${INIT_DRAFT_FROM:-/share/wanghanzhen/.cache/huggingface/hub/models--z-lab--Qwen3-8B-DFlash-b16/snapshots/071541888480df12d8a1ef7acbaabed88b0a8bd4}"
+    else
+        INIT_DRAFT_FROM="${INIT_DRAFT_FROM:-}"
+    fi
+fi
+TARGET_MODEL_BACKEND="${TARGET_MODEL_BACKEND:-hf}"
+
+LOG_INTERVAL="${LOG_INTERVAL:-50}"
+SAVE_INTERVAL="${SAVE_INTERVAL:-10000}"
+EVAL_INTERVAL="${EVAL_INTERVAL:-500}"
+
 REPORT_TO="${REPORT_TO:-wandb}"
 WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training}"
 WANDB_RUN_NAME="${WANDB_RUN_NAME:-}"
-WANDB_DIR="${WANDB_DIR:-./wandb}"  # 离线日志保存目录
-WANDB_RUN_ID="${WANDB_RUN_ID:-flashmtp_${DATA_NUM_SAMPLES}_${CHS_CONCAT_MODE}}"   # 离线子目录名称 (如: my_run_001，生成 offline-run-my_run_001)
+WANDB_DIR="${WANDB_DIR:-./wandb}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-dflash_pp_sample_${DATA_NUM_SAMPLES}}"
 
-# 数据参数
+TP_SIZE="${TP_SIZE:-1}"
+DIST_TIMEOUT="${DIST_TIMEOUT:-30}"
+
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-qwen3-thinking}"
 IS_PREFORMATTED="${IS_PREFORMATTED:-}"
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-8}"
 BUILD_DATASET_NUM_PROC="${BUILD_DATASET_NUM_PROC:-8}"
 
 
-# ========================================
-# 显示配置
-# ========================================
+
 echo "=========================================="
-echo "FlashMTP 训练启动脚本"
+echo "DFlash++ 训练启动脚本"
+echo "  模式: ${MODE} (posttraining=从DFlash继续训+低LR, scratch=从零+原LR)"
 echo "=========================================="
 echo "数据特征:"
 echo "  样本数量: ${DATA_NUM_SAMPLES}"
-echo "  思考模式: ${ENABLE_THINKING}"
-echo "  数据子目录: ${CHS_CONCAT_MODE}"
+echo "  思考模式: ${THINK_STR}"
+echo "  数据子目录: ${DATA_SUBDIR}"
 echo "------------------------------------------"
 echo "目标模型: ${TARGET_MODEL}"
 echo "目标模型后端: ${TARGET_MODEL_BACKEND}"
@@ -108,12 +155,18 @@ echo "  草稿模型层数: ${NUM_DRAFT_LAYERS}"
 echo "  块大小: ${BLOCK_SIZE}"
 echo "  锚点数量: ${NUM_ANCHORS}"
 echo "  Attention后端: ${ATTENTION_BACKEND}"
-echo "  Loss衰减Gamma: ${LOSS_DECAY_GAMMA:-未设置(不启用)}"
+echo "  DFlash Loss衰减Gamma: ${LOSS_DECAY_GAMMA:-未设置(不启用)}"
+echo "  L_con 权重 λ: ${COMPLETION_LOSS_WEIGHT}"
+echo "  L_con 权重 γ: ${COMPLETION_GAMMA}"
+echo "  L_con 前缀采样 w,b: ${COMPLETION_PREFIX_SAMPLE_WEIGHT}, ${COMPLETION_PREFIX_SAMPLE_BIAS}"
+echo "  L_dflash 权重 μ: ${DFLASH_LOSS_WEIGHT}"
+echo "  init-draft-from: ${INIT_DRAFT_FROM:-未设置}"
 echo "------------------------------------------"
 echo "训练配置:"
 echo "  训练轮数: ${NUM_EPOCHS}"
 echo "  批大小: ${BATCH_SIZE} x ${ACCUMULATION_STEPS} = $((BATCH_SIZE * ACCUMULATION_STEPS))"
 echo "  学习率: ${LEARNING_RATE}"
+echo "  eval 间隔: ${EVAL_INTERVAL} (train子集eval: ${EVAL_TRAIN_MAX_SAMPLES} 条, 0=关闭; 有 EVAL_DATA_PATH 时用独立 eval; 每轮最多 ${EVAL_MAX_BATCHES} batch)"
 echo "  最大长度: ${MAX_LENGTH}"
 echo "  预热比例: ${WARMUP_RATIO}"
 echo "  梯度裁剪: ${MAX_GRAD_NORM}"
@@ -124,16 +177,9 @@ echo "  NPROC_PER_NODE: ${NPROC_PER_NODE}"
 echo "  TP_SIZE: ${TP_SIZE}"
 echo "------------------------------------------"
 echo "Tracker: ${REPORT_TO}"
-if [ "${REPORT_TO}" = "wandb" ]; then
-    echo "  WandB目录: ${WANDB_DIR}"
-    if [ -n "${WANDB_RUN_ID}" ]; then
-        echo "  WandB运行ID: ${WANDB_RUN_ID} (离线子目录: offline-run-${WANDB_RUN_ID})"
-    fi
-fi
 echo "=========================================="
 echo ""
 
-# 如果输出目录已存在，自动添加数字后缀
 original_output_dir="${OUTPUT_DIR}"
 suffix=1
 while [ -d "${OUTPUT_DIR}" ] && [ -n "$(ls -A "${OUTPUT_DIR}" 2>/dev/null)" ]; do
@@ -144,16 +190,11 @@ if [ "${OUTPUT_DIR}" != "${original_output_dir}" ]; then
     echo "警告: 输出目录 ${original_output_dir} 已存在且非空，自动切换到: ${OUTPUT_DIR}"
 fi
 
-# 创建输出目录
 mkdir -p ${OUTPUT_DIR}
 mkdir -p ${CACHE_DIR}
-mkdir -p ${WANDB_DIR}
 
-# ========================================
-# 训练
-# ========================================
 echo ""
-echo "==> 开始训练 FlashMTP"
+echo "==> 开始训练 DFlash++"
 echo ""
 
 if [ "${NPROC_PER_NODE}" -gt 1 ]; then
@@ -162,7 +203,6 @@ else
     LAUNCHER=(python)
 fi
 
-# 构建可选参数
 OPTIONAL_ARGS=""
 
 if [ -n "${EVAL_DATA_PATH}" ]; then
@@ -185,6 +225,10 @@ if [ -n "${CKPT_DIR}" ]; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --ckpt-dir ${CKPT_DIR}"
 fi
 
+if [ -n "${INIT_DRAFT_FROM:-}" ]; then
+    OPTIONAL_ARGS="${OPTIONAL_ARGS} --init-draft-from ${INIT_DRAFT_FROM}"
+fi
+
 if [ "${REPORT_TO}" != "none" ]; then
     OPTIONAL_ARGS="${OPTIONAL_ARGS} --report-to ${REPORT_TO}"
     if [ "${REPORT_TO}" = "wandb" ] && [ -n "${WANDB_PROJECT}" ]; then
@@ -193,14 +237,9 @@ if [ "${REPORT_TO}" != "none" ]; then
     if [ -n "${WANDB_RUN_NAME}" ]; then
         OPTIONAL_ARGS="${OPTIONAL_ARGS} --wandb-run-name ${WANDB_RUN_NAME}"
     fi
-    if [ -n "${WANDB_RUN_ID}" ]; then
-        OPTIONAL_ARGS="${OPTIONAL_ARGS} --wandb-run-id ${WANDB_RUN_ID}"
-    fi
 fi
 
-# 运行训练
-EXIT_CODE=0
-"${LAUNCHER[@]}" ./scripts/train_flashmtp.py \
+"${LAUNCHER[@]}"    ./scripts/train_dflash_pp.py \
     --target-model-path ${TARGET_MODEL} \
     --target-model-backend ${TARGET_MODEL_BACKEND} \
     --train-data-path "${TRAIN_DATA_PATH}" \
@@ -210,6 +249,14 @@ EXIT_CODE=0
     --block-size ${BLOCK_SIZE} \
     --num-anchors ${NUM_ANCHORS} \
     --attention-backend ${ATTENTION_BACKEND} \
+    --completion-loss-weight ${COMPLETION_LOSS_WEIGHT} \
+    --completion-gamma ${COMPLETION_GAMMA} \
+    --completion-prefix-sample-weight ${COMPLETION_PREFIX_SAMPLE_WEIGHT} \
+    --completion-prefix-sample-bias ${COMPLETION_PREFIX_SAMPLE_BIAS} \
+    --dflash-loss-weight ${DFLASH_LOSS_WEIGHT} \
+    --eval-train-max-samples ${EVAL_TRAIN_MAX_SAMPLES} \
+    --eval-max-batches ${EVAL_MAX_BATCHES} \
+    --training-mode ${MODE} \
     --learning-rate ${LEARNING_RATE} \
     --warmup-ratio ${WARMUP_RATIO} \
     --num-epochs ${NUM_EPOCHS} \
@@ -225,22 +272,9 @@ EXIT_CODE=0
     --build-dataset-num-proc ${BUILD_DATASET_NUM_PROC} \
     --tp-size ${TP_SIZE} \
     --dist-timeout ${DIST_TIMEOUT} \
-    --chs-concat-mode ${CHS_CONCAT_MODE} \
     --seed 42 \
-    ${OPTIONAL_ARGS} 2>&1 || EXIT_CODE=$?
+    ${OPTIONAL_ARGS}
 
-# 检查训练是否成功
-if [ $EXIT_CODE -ne 0 ]; then
-    echo ""
-    echo "=========================================="
-    echo "训练失败 (退出码: $EXIT_CODE)"
-    echo "=========================================="
-    exit $EXIT_CODE
-fi
-
-# ========================================
-# 训练完成
-# ========================================
 echo ""
 echo "=========================================="
 echo "训练完成！"
@@ -249,8 +283,5 @@ echo "模型保存在: ${OUTPUT_DIR}"
 echo ""
 echo "使用示例："
 echo "  from specforge.modeling.draft.dflash import DFlashDraftModel"
-echo "  draft_model = DFlashDraftModel.from_pretrained('${OUTPUT_DIR}/epoch_${NUM_EPOCHS}_step_<step>')"
-echo ""
-echo "运行推理："
-echo "  python benchmark.py --draft-model ${OUTPUT_DIR}/epoch_${NUM_EPOCHS}_step_<step>"
+echo "  draft_model = DFlashDraftModel.from_pretrained('${OUTPUT_DIR}/epoch_6_step_<step>')"
 echo "=========================================="

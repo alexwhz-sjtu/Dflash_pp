@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # coding=utf-8
-"""FlashMTP Training Script."""
+"""DFlash++ training script: DFlash CE + L_con (clean-prefix completion)."""
 
 import argparse
 import logging
@@ -22,13 +22,13 @@ from transformers import AutoConfig, AutoTokenizer
 
 from datasets import load_dataset
 from specforge.args import SGLangBackendArgs, TrackerArgs
-from specforge.core.flashmtp import OnlineFlashMTPModel
+from specforge.core.dflash_pp import OnlineDFlashPPModel
 from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
-from specforge.modeling.draft.flashmtp import FlashMTPDraftModel
-from specforge.modeling.target.flashmtp_target_model import (
-    FlashMTPTargetModel,
-    get_flashmtp_target_model,
+from specforge.modeling.draft.dflash import DFlashDraftModel
+from specforge.modeling.target.dflash_target_model import (
+    DFlashTargetModel,
+    get_dflash_target_model,
 )
 from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 from specforge.optimizer import BF16Optimizer
@@ -37,7 +37,7 @@ from specforge.utils import get_last_checkpoint, print_on_rank0, print_with_rank
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train FlashMTP Draft Model")
+    parser = argparse.ArgumentParser(description="Train DFlash++ Draft Model")
 
     model_group = parser.add_argument_group("model")
     model_group.add_argument("--target-model-path", type=str, required=True)
@@ -77,8 +77,59 @@ def parse_args():
         "--loss-decay-gamma",
         type=float,
         default=None,
-        help="Gamma for exponential loss decay weighting (paper Eq.4). "
-        "Suggested: 7 for block_size=16, 5 for 10, 4 for 8. None disables.",
+        help="Gamma for DFlash branch exponential loss decay. "
+        "Suggested: 7 for block_size=16. None disables.",
+    )
+    model_group.add_argument(
+        "--dflash-loss-weight",
+        type=float,
+        default=1.0,
+        help="Multiplier for L_dflash: total = μ*L_dflash + λ*L_con",
+    )
+    model_group.add_argument(
+        "--completion-loss-weight",
+        type=float,
+        default=1.0,
+        help="Multiplier λ for L_con: total = μ*L_dflash + λ*L_con",
+    )
+    model_group.add_argument(
+        "--init-draft-from",
+        type=str,
+        default=None,
+        help="HF 目录：加载预训练 DFlash 草稿权重后再训 DFlash++（不与 --resume/--ckpt-dir 同用）。",
+    )
+    model_group.add_argument(
+        "--completion-gamma",
+        type=float,
+        default=7.0,
+        help="γ for L_con normalized exp weights (design §6). <=0 uses uniform 1/R.",
+    )
+    model_group.add_argument(
+        "--completion-prefix-sample-weight",
+        type=float,
+        default=1.0,
+        help="L_con prefix p sampling: logits_p = -w*(p-1-b)^2, P=softmax(logits). "
+        "w=0 → uniform on p∈[1,B-1]; larger w → sharper peak near p≈1+b.",
+    )
+    model_group.add_argument(
+        "--completion-prefix-sample-bias",
+        type=float,
+        default=0.0,
+        help="L_con sampling: peak of -w*(p-1-b)^2 near p≈1+b (within 1..B-1).",
+    )
+
+    eval_group = parser.add_argument_group("eval (test-in-loop)")
+    eval_group.add_argument(
+        "--eval-train-max-samples",
+        type=int,
+        default=0,
+        help="未提供 --eval-data-path 时，从训练集前若干条构造 eval；0 表示关闭（默认）。",
+    )
+    eval_group.add_argument(
+        "--eval-max-batches",
+        type=int,
+        default=32,
+        help="每次 eval 最多跑多少个 batch（控制耗时）。0 表示跑完整个 eval loader。",
     )
 
     dataset_group = parser.add_argument_group("dataset")
@@ -87,7 +138,6 @@ def parse_args():
     dataset_group.add_argument("--chat-template", type=str, default="qwen")
     dataset_group.add_argument("--is-preformatted", action="store_true")
     dataset_group.add_argument("--dataloader-num-workers", type=int, default=8)
-    dataset_group.add_argument("--chs-concat-mode", type=str, default="feature")
     dataset_group.add_argument(
         "--build-dataset-num-proc",
         type=int,
@@ -95,9 +145,22 @@ def parse_args():
     )
 
     training_group = parser.add_argument_group("training")
+    training_group.add_argument(
+        "--training-mode",
+        type=str,
+        default=None,
+        choices=["posttraining", "scratch"],
+        help="posttraining：从 DFlash 继续训（建议配合较低 LR）；scratch：从零训练（建议原 LR 6e-4）。"
+        "仅作记录；实际 LR 由 --learning-rate 决定。",
+    )
     training_group.add_argument("--num-epochs", type=int, default=6)
     training_group.add_argument("--batch-size", type=int, default=1)
-    training_group.add_argument("--learning-rate", type=float, default=6e-4)
+    training_group.add_argument(
+        "--learning-rate",
+        type=float,
+        default=6e-4,
+        help="从零训练常用 6e-4；从 DFlash 继续训常用约 1.5e-4（见 run_training_dflash_pp.sh 按 --mode 默认）。",
+    )
     training_group.add_argument("--max-length", type=int, default=3072)
     training_group.add_argument("--warmup-ratio", type=float, default=0.04)
     training_group.add_argument("--max-grad-norm", type=float, default=1.0)
@@ -132,14 +195,13 @@ def parse_args():
     dist_group = parser.add_argument_group("distributed")
     dist_group.add_argument("--dist-timeout", type=int, default=30)
 
-    # SGLang specific args
     sglang_group = parser.add_argument_group("sglang backend")
     SGLangBackendArgs.add_args(sglang_group)
 
     return parser.parse_args()
 
 
-def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
+def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
     """Build target model (backend wrapper) and draft model."""
     print_on_rank0(
         f"Loading target model from {args.target_model_path} using {args.target_model_backend} backend"
@@ -149,7 +211,7 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
     if args.target_model_backend == "sglang":
         target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
 
-    target_model = get_flashmtp_target_model(
+    target_model = get_dflash_target_model(
         pretrained_model_name_or_path=args.target_model_path,
         backend=args.target_model_backend,
         torch_dtype=torch.bfloat16,
@@ -169,15 +231,13 @@ def build_models(args) -> Tuple[FlashMTPTargetModel, FlashMTPDraftModel]:
         draft_config.num_target_layers = target_config.num_hidden_layers
         print_on_rank0("Auto-generated draft config from target model")
 
-    if not hasattr(draft_config, "flashmtp_config") or draft_config.flashmtp_config is None:
-        draft_config.flashmtp_config = {}
-        
-    draft_config.flashmtp_config["chs_concat_mode"] = args.chs_concat_mode
+    if not hasattr(draft_config, "dflash_config") or draft_config.dflash_config is None:
+        draft_config.dflash_config = {}
 
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
 
-    draft_model = FlashMTPDraftModel(draft_config).cuda().to(torch.bfloat16)
+    draft_model = DFlashDraftModel(draft_config).cuda().to(torch.bfloat16)
 
     target_model.set_capture_layers(draft_model.target_layer_ids)
 
@@ -251,19 +311,35 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
             shuffle=False,
             process_group=get_dp_group(),
         )
+        print_on_rank0(
+            f"Eval dataloader from eval-data-path: {len(eval_eagle3_dataset)} samples"
+        )
+    elif args.eval_train_max_samples > 0:
+        n_ev = min(args.eval_train_max_samples, len(train_eagle3_dataset))
+        eval_subset = train_eagle3_dataset.select(range(n_ev))
+        eval_dataloader = prepare_dp_dataloaders(
+            eval_subset,
+            args.batch_size,
+            num_workers=args.dataloader_num_workers,
+            shuffle=False,
+            process_group=get_dp_group(),
+        )
+        print_on_rank0(
+            f"Eval dataloader from train subset: first {n_ev} samples (test-in-loop)"
+        )
 
     return train_dataloader, eval_dataloader
 
 
-def save_checkpoint(args, epoch, step, flashmtp_model, draft_model, optimizer):
-    """Save checkpoint."""
+def save_checkpoint(args, epoch, step, dflash_pp_model, draft_model, optimizer):
+    """Save checkpoint (draft weights + optional dflash_pp trainer source copy)."""
     save_dir = os.path.join(args.output_dir, f"epoch_{epoch}_step_{step}")
     if dist.get_rank() == 0:
         os.makedirs(save_dir, exist_ok=True)
     dist.barrier()
 
-    with FSDP.state_dict_type(flashmtp_model, StateDictType.FULL_STATE_DICT):
-        state_dict = flashmtp_model.state_dict()
+    with FSDP.state_dict_type(dflash_pp_model, StateDictType.FULL_STATE_DICT):
+        state_dict = dflash_pp_model.state_dict()
         draft_state_dict = {
             k.replace("draft_model.", ""): v
             for k, v in state_dict.items()
@@ -283,17 +359,15 @@ def save_checkpoint(args, epoch, step, flashmtp_model, draft_model, optimizer):
 
             draft_model.save_pretrained(save_dir, state_dict=draft_state_dict)
 
-            modeling_src = os.path.join(
-                os.path.dirname(__file__),
-                "..",
-                "specforge",
-                "modeling",
-                "draft",
-                "flashmtp.py",
-            )
-            modeling_dst = os.path.join(save_dir, "flashmtp.py")
-            if os.path.exists(modeling_src):
-                shutil.copy(modeling_src, modeling_dst)
+            specforge_root = os.path.join(os.path.dirname(__file__), "..", "specforge")
+            copies = [
+                ("dflash.py", os.path.join(specforge_root, "modeling", "draft", "dflash.py")),
+                ("dflash_pp.py", os.path.join(specforge_root, "core", "dflash_pp.py")),
+            ]
+            for dst_name, modeling_src in copies:
+                modeling_dst = os.path.join(save_dir, dst_name)
+                if os.path.exists(modeling_src):
+                    shutil.copy(modeling_src, modeling_dst)
 
             print_on_rank0(f"Saved checkpoint to {save_dir}")
 
@@ -304,6 +378,8 @@ def record_metrics(
     args,
     loss: float,
     accuracy: float,
+    loss_dflash: float,
+    loss_con: float,
     global_step: int,
     tracker,
     optimizer,
@@ -317,12 +393,84 @@ def record_metrics(
 
     logdict[f"{mode}/loss"] = loss
     logdict[f"{mode}/accuracy"] = accuracy
+    logdict[f"{mode}/loss_dflash"] = loss_dflash
+    logdict[f"{mode}/loss_con"] = loss_con
 
+    step_hint = ""
+    if train_dataloader is not None and mode == "train":
+        est = args.num_epochs * max(len(train_dataloader), 1) // max(
+            args.accumulation_steps, 1
+        )
+        step_hint = f"[{global_step}/{est}], "
     print_on_rank0(
-        f"{mode.capitalize()} - Step {global_step} [{global_step}/{args.num_epochs * len(train_dataloader) // args.accumulation_steps}?], Loss: {loss:.4f}, Acc: {accuracy:.4f}"
+        f"{mode.capitalize()} - Step {global_step} {step_hint}"
+        f"Loss: {loss:.4f} (dflash {loss_dflash:.4f}, con {loss_con:.4f}), Acc: {accuracy:.4f}"
     )
 
     tracker.log(logdict, step=global_step)
+
+
+@torch.no_grad()
+def run_eval(
+    args,
+    dflash_pp_model,
+    target_model,
+    eval_dataloader,
+    global_step: int,
+    tracker,
+    optimizer,
+) -> None:
+    """Test-in-loop: eval loss/acc on eval_dataloader (subset of train or eval file)."""
+    dflash_pp_model.eval()
+    target_model.eval()
+
+    loss_acc = torch.zeros(4, device="cuda", dtype=torch.float64)
+    n_batches = torch.zeros(1, device="cuda", dtype=torch.float64)
+
+    for i, data in enumerate(eval_dataloader):
+        if args.eval_max_batches > 0 and i >= args.eval_max_batches:
+            break
+        input_ids = data["input_ids"].cuda()
+        attention_mask = data["attention_mask"].cuda()
+        loss_mask = data["loss_mask"].cuda()
+        target_output = target_model.generate_dflash_data(
+            input_ids, attention_mask, loss_mask
+        )
+        hidden_states = target_output.hidden_states.cuda()
+
+        loss, accuracy, loss_dflash, loss_con = dflash_pp_model(
+            input_ids=input_ids,
+            hidden_states=hidden_states,
+            loss_mask=loss_mask,
+        )
+        loss_acc[0] += loss.float()
+        loss_acc[1] += accuracy.float()
+        loss_acc[2] += loss_dflash.float()
+        loss_acc[3] += loss_con.float()
+        n_batches[0] += 1.0
+
+    dist.all_reduce(loss_acc)
+    dist.all_reduce(n_batches)
+    nb = n_batches[0].item()
+    if nb < 1e-6:
+        dflash_pp_model.train()
+        target_model.train()
+        return
+    record_metrics(
+        args,
+        (loss_acc[0] / nb).item(),
+        (loss_acc[1] / nb).item(),
+        (loss_acc[2] / nb).item(),
+        (loss_acc[3] / nb).item(),
+        global_step,
+        tracker,
+        optimizer,
+        train_dataloader=None,
+        mode="eval",
+    )
+
+    dflash_pp_model.train()
+    target_model.train()
 
 
 def main():
@@ -343,10 +491,15 @@ def main():
 
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
     print_with_rank("Initialized distributed")
+    if args.training_mode:
+        print_on_rank0(
+            f"training_mode={args.training_mode}, learning_rate={args.learning_rate}"
+        )
 
     target_model, draft_model = build_models(args)
 
     draft_model_last_checkpoint = None
+    ckpt_info = None
     if args.ckpt_dir is not None:
         if os.path.isdir(args.ckpt_dir):
             draft_model_last_checkpoint = args.ckpt_dir
@@ -364,7 +517,7 @@ def main():
 
     resume_state = None
     if draft_model_last_checkpoint:
-        loaded_model = FlashMTPDraftModel.from_pretrained(
+        loaded_model = DFlashDraftModel.from_pretrained(
             draft_model_last_checkpoint, torch_dtype=torch.bfloat16
         )
         draft_model.load_state_dict(loaded_model.state_dict())
@@ -382,6 +535,25 @@ def main():
                 f"Will resume from epoch {resume_state['epoch']}, "
                 f"step {resume_state['global_step']}"
             )
+    elif args.init_draft_from:
+        print_on_rank0(f"Loading draft init from pretrained DFlash: {args.init_draft_from}")
+        pre = DFlashDraftModel.from_pretrained(
+            args.init_draft_from,
+            torch_dtype=torch.bfloat16,
+        )
+        incomp = draft_model.load_state_dict(pre.state_dict(), strict=False)
+        if incomp.missing_keys:
+            print_on_rank0(
+                f"init-draft-from: missing_keys (count={len(incomp.missing_keys)}): "
+                f"{incomp.missing_keys[:8]}..."
+            )
+        if incomp.unexpected_keys:
+            print_on_rank0(
+                f"init-draft-from: unexpected_keys (count={len(incomp.unexpected_keys)}): "
+                f"{incomp.unexpected_keys[:8]}..."
+            )
+        del pre
+        draft_model.cuda()
 
     tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
 
@@ -392,16 +564,12 @@ def main():
     else:
         tokenizer.add_special_tokens({"mask_token": "<|MASK|>"})
         mask_token_id = tokenizer.mask_token_id
-        
-    print_on_rank0(f"****** Important: Make sure using the same mask_token_id with inference.***** \n Using mask_token_id: {mask_token_id} \n")
-
+    print_on_rank0(f"Using mask_token_id: {mask_token_id}")
 
     draft_model.mask_token_id = mask_token_id
-    
-    draft_model.config.flashmtp_config["chs_concat_mode"] = args.chs_concat_mode
-    draft_model.config.flashmtp_config["mask_token_id"] = mask_token_id
-    draft_model.config.flashmtp_config["target_layer_ids"] = draft_model.target_layer_ids
-    print_on_rank0(f"flashmtp_config: {draft_model.config.flashmtp_config}")
+    draft_model.config.dflash_config["mask_token_id"] = mask_token_id
+    draft_model.config.dflash_config["target_layer_ids"] = draft_model.target_layer_ids
+    print_on_rank0(f"dflash_config: {draft_model.config.dflash_config}")
 
     train_dataloader, eval_dataloader = build_dataloader(args, tokenizer)
 
@@ -412,13 +580,17 @@ def main():
     print_on_rank0("Loading target embeddings and head...")
     target_components = TargetEmbeddingsAndHead.from_pretrained(
         args.target_model_path,
-        embed_key="model.embed_tokens.weight",  # Adjust if Qwen/Llama differs
+        embed_key="model.embed_tokens.weight",
         lm_head_key="lm_head.weight",
         device="cuda",
         trust_remote_code=args.trust_remote_code,
     )
 
-    flashmtp_model = OnlineFlashMTPModel(
+    completion_gamma = (
+        args.completion_gamma if args.completion_gamma > 0 else None
+    )
+
+    dflash_pp_model = OnlineDFlashPPModel(
         draft_model=draft_model,
         target_lm_head=target_components.lm_head,
         target_embed_tokens=target_components.embed_tokens,
@@ -427,11 +599,15 @@ def main():
         attention_backend=args.attention_backend,
         num_anchors=args.num_anchors,
         loss_decay_gamma=args.loss_decay_gamma,
-        chs_concat_mode=args.chs_concat_mode,
+        dflash_loss_weight=args.dflash_loss_weight,
+        completion_loss_weight=args.completion_loss_weight,
+        completion_gamma=completion_gamma,
+        completion_prefix_sample_weight=args.completion_prefix_sample_weight,
+        completion_prefix_sample_bias=args.completion_prefix_sample_bias,
     )
 
-    flashmtp_model = FSDP(
-        flashmtp_model,
+    dflash_pp_model = FSDP(
+        dflash_pp_model,
         use_orig_params=True,
         mixed_precision=MixedPrecision(
             param_dtype=torch.bfloat16,
@@ -448,9 +624,10 @@ def main():
         warmup_ratio=args.warmup_ratio,
         total_steps=total_steps,
     )
-    skip_steps=0
+
     start_epoch = 0
     global_step = 0
+    skip_steps = 0
     if resume_state is not None:
         optimizer.scheduler.load_state_dict(resume_state["scheduler_state_dict"])
         start_epoch = resume_state["epoch"]
@@ -486,17 +663,12 @@ def main():
             input_ids = data["input_ids"].cuda()
             attention_mask = data["attention_mask"].cuda()
             loss_mask = data["loss_mask"].cuda()
-
-            # here target output is the full sequence
-            target_output = target_model.generate_flashmtp_data(
+            target_output = target_model.generate_dflash_data(
                 input_ids, attention_mask, loss_mask
             )
-            
-            # 将元组中的每个 tensor 都移动到 GPU
-            hidden_states = tuple(h.cuda() for h in target_output.hidden_states)
-            # hidden_states = target_output.hidden_states.cuda()  # Ensure on GPU
+            hidden_states = target_output.hidden_states.cuda()
 
-            loss, accuracy = flashmtp_model(
+            loss, accuracy, loss_dflash, loss_con = dflash_pp_model(
                 input_ids=input_ids,
                 hidden_states=hidden_states,
                 loss_mask=loss_mask,
@@ -510,20 +682,44 @@ def main():
             if global_step % args.log_interval == 0:
                 loss_log = loss.clone()
                 acc_log = accuracy.clone()
+                ldf_log = loss_dflash.clone()
+                lcon_log = loss_con.clone()
                 dist.all_reduce(loss_log)
                 dist.all_reduce(acc_log)
-                loss_log = loss_log / dist.get_world_size()
-                acc_log = acc_log / dist.get_world_size()
+                dist.all_reduce(ldf_log)
+                dist.all_reduce(lcon_log)
+                ws = dist.get_world_size()
+                loss_log = loss_log / ws
+                acc_log = acc_log / ws
+                ldf_log = ldf_log / ws
+                lcon_log = lcon_log / ws
 
                 record_metrics(
                     args,
                     loss_log.item(),
                     acc_log.item(),
+                    ldf_log.item(),
+                    lcon_log.item(),
                     global_step,
                     tracker,
                     optimizer,
                     train_dataloader,
                     mode="train",
+                )
+
+            if (
+                eval_dataloader is not None
+                and args.eval_interval > 0
+                and global_step % args.eval_interval == 0
+            ):
+                run_eval(
+                    args,
+                    dflash_pp_model,
+                    target_model,
+                    eval_dataloader,
+                    global_step,
+                    tracker,
+                    optimizer,
                 )
 
             if dist.get_rank() == 0:
@@ -532,6 +728,8 @@ def main():
                 progress_bar.set_postfix(
                     {
                         "loss": f"{loss.item():.4f}",
+                        "Ldf": f"{loss_dflash.item():.4f}",
+                        "Lcon": f"{loss_con.item():.4f}",
                         "acc": f"{accuracy.item():.4f}",
                         "iter_time": f"{elapsed:.2f}s",
                     }
@@ -539,11 +737,11 @@ def main():
 
             if global_step % args.save_interval == 0:
                 save_checkpoint(
-                    args, epoch, global_step, flashmtp_model, draft_model, optimizer
+                    args, epoch, global_step, dflash_pp_model, draft_model, optimizer
                 )
 
     save_checkpoint(
-        args, args.num_epochs, global_step, flashmtp_model, draft_model, optimizer
+        args, args.num_epochs, global_step, dflash_pp_model, draft_model, optimizer
     )
 
     tracker.close()
