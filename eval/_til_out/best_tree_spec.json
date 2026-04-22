@@ -1,0 +1,7 @@
+{
+  "truncation_policy": "min_prob",
+  "max_block_inner_iters": 1,
+  "trunc_tau": 0.88,
+  "trunc_risk_eps": 0.35,
+  "use_draft_tree": true
+}
