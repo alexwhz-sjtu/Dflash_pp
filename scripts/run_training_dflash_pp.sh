@@ -46,7 +46,7 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 MASTER_PORT="${MASTER_PORT:-29502}"
 
-NUM_EPOCHS="${NUM_EPOCHS:-6}"
+NUM_EPOCHS="${NUM_EPOCHS:-16}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-1}"
 # 按模式默认学习率（仍可用环境变量 LEARNING_RATE 覆盖）
@@ -63,7 +63,7 @@ MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 # ========================================
 # 主要数据集参数
 # ========================================
-DATA_NUM_SAMPLES="${DATA_NUM_SAMPLES:-40000}"
+DATA_NUM_SAMPLES="${DATA_NUM_SAMPLES:-400000}"
 ENABLE_THINKING="${ENABLE_THINKING:-on}"
 DATASET_BASE_DIR="${DATASET_BASE_DIR:-./cache/dataset}"
 if [ "${ENABLE_THINKING}" = "on" ] || [ "${ENABLE_THINKING}" = "true" ] || [ "${ENABLE_THINKING}" = "1" ]; then
@@ -79,13 +79,12 @@ CACHE_DIR="${CACHE_DIR:-./cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}}"
 
 NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-5}"
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
-NUM_ANCHORS="${NUM_ANCHORS:-512}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}"
 LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-7}"
 
 # DFlash++：总损失 = μ*L_dflash + λ*L_con；前缀 p 采样 logits_p = -w*(p-1-b)^2
-DFLASH_LOSS_WEIGHT="${DFLASH_LOSS_WEIGHT:-1.0}"
-COMPLETION_LOSS_WEIGHT="${COMPLETION_LOSS_WEIGHT:-0.8}"
+DFLASH_LOSS_WEIGHT="${DFLASH_LOSS_WEIGHT:-0.4}"
+COMPLETION_LOSS_WEIGHT="${COMPLETION_LOSS_WEIGHT:-0.6}"
 COMPLETION_GAMMA="${COMPLETION_GAMMA:-7}"
 COMPLETION_PREFIX_SAMPLE_WEIGHT="${COMPLETION_PREFIX_SAMPLE_WEIGHT:-0.1}"
 COMPLETION_PREFIX_SAMPLE_BIAS="${COMPLETION_PREFIX_SAMPLE_BIAS:-0.0}"
@@ -102,15 +101,20 @@ if [ "$DT" = "qz" ]; then
     OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/DFlash_pp_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
     TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
 else
-    TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
-    OUTPUT_DIR="./cache/models/flashmtp_v3.1_nemotron_think_on_samples_40000_qwen3_8b"
+    TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/dataset/Nemotron_regen/Qwen3-8B/nemotron_400000_tp_0/nemotron_400000_train_regen.jsonl"
+    OUTPUT_DIR="./cache/models/DFlash_pp_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}"
     TARGET_MODEL="${TARGET_MODEL:-/share/public/public_models/Qwen3-8B}"
-    # scratch 默认不加载 DFlash；posttraining 默认加载预训练 DFlash 草稿
-    if [ "$MODE" = "posttraining" ]; then
+fi
+
+# scratch 默认不加载 DFlash；posttraining 按 --dt 选择预训练 DFlash 草稿默认路径
+if [ "$MODE" = "posttraining" ]; then
+    if [ "$DT" = "qz" ]; then
         INIT_DRAFT_FROM="${INIT_DRAFT_FROM:-/share/wanghanzhen/.cache/huggingface/hub/models--z-lab--Qwen3-8B-DFlash-b16/snapshots/071541888480df12d8a1ef7acbaabed88b0a8bd4}"
     else
-        INIT_DRAFT_FROM="${INIT_DRAFT_FROM:-}"
+        INIT_DRAFT_FROM="${INIT_DRAFT_FROM:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/z-lab/Qwen3-8B-DFlash-b16}"
     fi
+else
+    INIT_DRAFT_FROM="${INIT_DRAFT_FROM:-}"
 fi
 TARGET_MODEL_BACKEND="${TARGET_MODEL_BACKEND:-hf}"
 
@@ -119,10 +123,10 @@ SAVE_INTERVAL="${SAVE_INTERVAL:-10000}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-500}"
 
 REPORT_TO="${REPORT_TO:-wandb}"
-WANDB_PROJECT="${WANDB_PROJECT:-flashmtp-training}"
+WANDB_PROJECT="${WANDB_PROJECT:-dflash_pp}"
 WANDB_RUN_NAME="${WANDB_RUN_NAME:-}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"
-WANDB_RUN_ID="${WANDB_RUN_ID:-dflash_pp_sample_${DATA_NUM_SAMPLES}}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-dflash_pp_sample_${DATA_NUM_SAMPLES}_lbase_${DFLASH_LOSS_WEIGHT}_lcon_${COMPLETION_LOSS_WEIGHT}}"
 
 TP_SIZE="${TP_SIZE:-1}"
 DIST_TIMEOUT="${DIST_TIMEOUT:-30}"
