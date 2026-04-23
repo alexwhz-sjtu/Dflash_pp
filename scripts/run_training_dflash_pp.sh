@@ -22,8 +22,6 @@ if [[ "$MODE" != "posttraining" && "$MODE" != "scratch" ]]; then
     exit 1
 fi
 
-expory
-
 # a800：更保守锚点数，减轻显存峰值
 if [ "$DT" = "a800" ]; then
     MAX_LENGTH="${MAX_LENGTH:-4096}"
@@ -46,9 +44,9 @@ fi
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
-MASTER_PORT="${MASTER_PORT:-29501}"
+MASTER_PORT="${MASTER_PORT:-29502}"
 
-NUM_EPOCHS="${NUM_EPOCHS:-16}"
+NUM_EPOCHS="${NUM_EPOCHS:-8}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-1}"
 # 按模式默认学习率（仍可用环境变量 LEARNING_RATE 覆盖）
@@ -88,7 +86,7 @@ LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-7}"
 DFLASH_LOSS_WEIGHT="${DFLASH_LOSS_WEIGHT:-0.4}"
 COMPLETION_LOSS_WEIGHT="${COMPLETION_LOSS_WEIGHT:-0.6}"
 COMPLETION_GAMMA="${COMPLETION_GAMMA:-7}"
-COMPLETION_PREFIX_SAMPLE_WEIGHT="${COMPLETION_PREFIX_SAMPLE_WEIGHT:-0.1}"
+COMPLETION_PREFIX_SAMPLE_WEIGHT="${COMPLETION_PREFIX_SAMPLE_WEIGHT:-0.05}"
 COMPLETION_PREFIX_SAMPLE_BIAS="${COMPLETION_PREFIX_SAMPLE_BIAS:-0.0}"
 
 # 默认不做「训练集前 N 条」eval；单独评估请设 EVAL_DATA_PATH。若需恢复可 export EVAL_TRAIN_MAX_SAMPLES>0
@@ -99,6 +97,9 @@ EVAL_MAX_BATCHES="${EVAL_MAX_BATCHES:-32}"
 # 主要路径
 # ========================================
 if [ "$DT" = "qz" ]; then
+    # export NNODES=2
+    # export NODE_RANK=${RANK:-0}
+    export WANDB_MODE=offline
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
     OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/DFlash_pp_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
     TARGET_MODEL="${TARGET_MODEL:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-8B}"
@@ -243,6 +244,9 @@ if [ "${REPORT_TO}" != "none" ]; then
     fi
     if [ -n "${WANDB_RUN_NAME}" ]; then
         OPTIONAL_ARGS="${OPTIONAL_ARGS} --wandb-run-name ${WANDB_RUN_NAME}"
+    fi
+    if [ -n "${WANDB_RUN_ID}" ]; then
+        OPTIONAL_ARGS="${OPTIONAL_ARGS} --wandb-run-id ${WANDB_RUN_ID}"
     fi
 fi
 
