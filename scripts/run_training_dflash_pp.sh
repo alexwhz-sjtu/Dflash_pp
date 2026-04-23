@@ -108,7 +108,7 @@ fi
 
 # scratch 默认不加载 DFlash；posttraining 按 --dt 选择预训练 DFlash 草稿默认路径
 if [ "$MODE" = "posttraining" ]; then
-    if [ "$DT" = "qz" ]; then
+    if [ "$DT" = "a800" ]; then
         INIT_DRAFT_FROM="${INIT_DRAFT_FROM:-/share/wanghanzhen/.cache/huggingface/hub/models--z-lab--Qwen3-8B-DFlash-b16/snapshots/071541888480df12d8a1ef7acbaabed88b0a8bd4}"
     else
         INIT_DRAFT_FROM="${INIT_DRAFT_FROM:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/z-lab/Qwen3-8B-DFlash-b16}"

@@ -18,9 +18,10 @@ from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3RMSNorm,
     Qwen3RotaryEmbedding,
     eager_attention_forward,
-    rotate_half,
 )
 from typing_extensions import Tuple, Unpack
+
+from specforge.modeling.draft.dflash_rope import apply_rotary_pos_emb
 
 
 def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
@@ -91,15 +92,6 @@ def _mean_int(xs: List[int]) -> float:
     if not xs:
         return 0.0
     return float(sum(xs)) / len(xs)
-
-
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_len = q.size(-2)
-    q_embed = (q * cos[..., -q_len:, :]) + (rotate_half(q) * sin[..., -q_len:, :])
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
 
 
 class Qwen3DFlashAttention(nn.Module):
@@ -316,13 +308,27 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
     ) -> CausalLMOutputWithPast:
         hidden_states = noise_embedding
         target_hidden = self.hidden_norm(self.fc(target_hidden))
-        # RoPE：attention 里 k = [k_ctx(ctx_len), k_q(q_len)]，cos/sin 必须与 k 的序列长度一致
+        # RoPE：k = [k_ctx(ctx_len), k_draft(q_len)]。两种 position 输入：
+        # 1) 训练/批量：position_ids 已是 [context(0..S-1)|draft(...)]，长度 = ctx_len + q_len
+        # 2) 推理 _draft_forward_block_logits：仅传 draft 段 position_ids，长度 = q_len，需再拼 context 位
         ctx_len = target_hidden.shape[1]
         q_len = hidden_states.shape[1]
         bsz = hidden_states.shape[0]
         if ctx_len == 0:
             position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        elif position_ids.size(1) == ctx_len + q_len:
+            rope_in = hidden_states.new_ones(
+                bsz, ctx_len + q_len, hidden_states.size(-1)
+            )
+            position_embeddings = self.rotary_emb(rope_in, position_ids)
         else:
+            # 仅含当前块在全局上的位置，长度 = q_len
+            if position_ids.size(1) != q_len:
+                raise ValueError(
+                    f"DFlash forward: expected position_ids len {q_len} (draft only) or "
+                    f"{ctx_len + q_len} (full), got {position_ids.size(1)}. "
+                    f"ctx_len={ctx_len}, q_len={q_len}."
+                )
             draft0 = position_ids[:, 0:1]
             ctx_pos = draft0 - ctx_len + torch.arange(
                 ctx_len,
@@ -330,10 +336,10 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 dtype=position_ids.dtype,
             ).view(1, -1)
             full_pos = torch.cat([ctx_pos, position_ids], dim=-1)
-            rope_x = hidden_states.new_ones(
+            rope_in = hidden_states.new_ones(
                 bsz, ctx_len + q_len, hidden_states.size(-1)
             )
-            position_embeddings = self.rotary_emb(rope_x, full_pos)
+            position_embeddings = self.rotary_emb(rope_in, full_pos)
         for layer in self.layers:
             hidden_states = layer(
                 hidden_states=hidden_states,
