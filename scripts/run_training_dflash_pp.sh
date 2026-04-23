@@ -22,6 +22,8 @@ if [[ "$MODE" != "posttraining" && "$MODE" != "scratch" ]]; then
     exit 1
 fi
 
+expory
+
 # a800：更保守锚点数，减轻显存峰值
 if [ "$DT" = "a800" ]; then
     MAX_LENGTH="${MAX_LENGTH:-4096}"
@@ -44,7 +46,7 @@ fi
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
-MASTER_PORT="${MASTER_PORT:-29502}"
+MASTER_PORT="${MASTER_PORT:-29501}"
 
 NUM_EPOCHS="${NUM_EPOCHS:-16}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
@@ -99,22 +101,18 @@ EVAL_MAX_BATCHES="${EVAL_MAX_BATCHES:-32}"
 if [ "$DT" = "qz" ]; then
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
     OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/DFlash_pp_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
-    TARGET_MODEL="${TARGET_MODEL:-$WHZ_DIR/models/Qwen/Qwen3-8B}"
+    TARGET_MODEL="${TARGET_MODEL:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-8B}"
 else
-    TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/dataset/Nemotron_regen/Qwen3-8B/nemotron_400000_tp_0/nemotron_400000_train_regen.jsonl"
-    OUTPUT_DIR="./cache/models/DFlash_pp_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}"
+    TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
+    OUTPUT_DIR="./cache/models/flashmtp_v3.1_nemotron_think_on_samples_40000_qwen3_8b"
     TARGET_MODEL="${TARGET_MODEL:-/share/public/public_models/Qwen3-8B}"
-fi
-
-# scratch 默认不加载 DFlash；posttraining 按 --dt 选择预训练 DFlash 草稿默认路径
-if [ "$MODE" = "posttraining" ]; then
-    if [ "$DT" = "a800" ]; then
-        INIT_DRAFT_FROM="${INIT_DRAFT_FROM:-/share/wanghanzhen/.cache/huggingface/hub/models--z-lab--Qwen3-8B-DFlash-b16/snapshots/071541888480df12d8a1ef7acbaabed88b0a8bd4}"
-    else
+    # scratch 默认不加载 DFlash；posttraining 默认加载预训练 DFlash 草稿
+    if [ "$MODE" = "posttraining" ]; then
+        # INIT_DRAFT_FROM="${INIT_DRAFT_FROM:-/share/wanghanzhen/.cache/huggingface/hub/models--z-lab--Qwen3-8B-DFlash-b16/snapshots/071541888480df12d8a1ef7acbaabed88b0a8bd4}"
         INIT_DRAFT_FROM="${INIT_DRAFT_FROM:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/z-lab/Qwen3-8B-DFlash-b16}"
+    else
+        INIT_DRAFT_FROM="${INIT_DRAFT_FROM:-}"
     fi
-else
-    INIT_DRAFT_FROM="${INIT_DRAFT_FROM:-}"
 fi
 TARGET_MODEL_BACKEND="${TARGET_MODEL_BACKEND:-hf}"
 
