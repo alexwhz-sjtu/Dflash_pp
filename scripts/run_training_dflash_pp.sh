@@ -106,14 +106,19 @@ else
     TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
     OUTPUT_DIR="./cache/models/flashmtp_v3.1_nemotron_think_on_samples_40000_qwen3_8b"
     TARGET_MODEL="${TARGET_MODEL:-/share/public/public_models/Qwen3-8B}"
-    # scratch 默认不加载 DFlash；posttraining 默认加载预训练 DFlash 草稿
-    if [ "$MODE" = "posttraining" ]; then
-        # INIT_DRAFT_FROM="${INIT_DRAFT_FROM:-/share/wanghanzhen/.cache/huggingface/hub/models--z-lab--Qwen3-8B-DFlash-b16/snapshots/071541888480df12d8a1ef7acbaabed88b0a8bd4}"
+fi
+
+# scratch 默认不加载 DFlash；posttraining 默认加载预训练 DFlash 草稿
+if [ "$MODE" = "posttraining" ]; then
+    if [ "$DT" = "qz" ]; then
         INIT_DRAFT_FROM="${INIT_DRAFT_FROM:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/z-lab/Qwen3-8B-DFlash-b16}"
     else
-        INIT_DRAFT_FROM="${INIT_DRAFT_FROM:-}"
+        INIT_DRAFT_FROM="${INIT_DRAFT_FROM:-/share/wanghanzhen/.cache/huggingface/hub/models--z-lab--Qwen3-8B-DFlash-b16/snapshots/071541888480df12d8a1ef7acbaabed88b0a8bd4}"
     fi
+else
+    INIT_DRAFT_FROM="${INIT_DRAFT_FROM:-}"
 fi
+
 TARGET_MODEL_BACKEND="${TARGET_MODEL_BACKEND:-hf}"
 
 LOG_INTERVAL="${LOG_INTERVAL:-50}"
