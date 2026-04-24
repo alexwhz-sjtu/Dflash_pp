@@ -113,14 +113,14 @@ def main() -> None:
         "-w",
         "--weight",
         type=float,
-        default=0.1,
+        default=0.05,
         help="completion_prefix_sample_weight",
     )
     parser.add_argument(
         "-b",
         "--bias",
         type=float,
-        default=1.0,
+        default=0.0,
         help="completion_prefix_sample_bias",
     )
     parser.add_argument(

@@ -33,7 +33,7 @@ DFlashDraftModel = _dflash_mod.DFlashDraftModel
 
 _DEFAULT_DRAFT_PP = (
     "/share/wanghanzhen/SpeculativeDecoding/NIPS26/DFlash++/cache/models/"
-    "flashmtp_v3.1_nemotron_think_on_samples_40000_qwen3_8b/epoch_6_step_12750"
+    "DFlash_pp_sample_400000_think_on_qwen3_8b_maxlen4096_epochs16_1/epoch_3_step_140000"
 )
 
 
@@ -198,6 +198,8 @@ def multi_turn_dialogue(
                     f"{stats.get('mean_posthoc_suffix_accept_gain_corrected', stats.get('mean_posthoc_suffix_accept_gain', 0)):.4f} | "
                     f"executed={stats.get('n_posthoc_suffix_refine_executed', stats.get('n_posthoc_suffix_events', 0))} | "
                     f"skipped_anchor_only={stats.get('n_posthoc_suffix_skipped_anchor_only', 0)} | "
+                    f"skipped_acc1_out_of_range={stats.get('n_posthoc_suffix_skipped_acc1_out_of_range', 0)} | "
+                    f"acc1_range=[{stats.get('posthoc_acc1_min', 2)},{stats.get('posthoc_acc1_max', 14)}] | "
                     f"target_extra_s={stats.get('target_posthoc_extra_time', 0):.4f}\n"
                 )
             log_file.write(
@@ -226,6 +228,7 @@ def summarize_question_stats(turn_stats, responses=None):
     posthoc_gains_flat: List[float] = []
     posthoc_pairs_flat: List[List[float]] = []
     posthoc_skipped_anchor_total = 0
+    posthoc_skipped_acc1_oor_total = 0
     posthoc_executed_total = 0
     target_posthoc_extra = 0.0
 
@@ -252,6 +255,9 @@ def summarize_question_stats(turn_stats, responses=None):
                 posthoc_pairs_flat.append([float(pair[0]), float(pair[1])])
         posthoc_skipped_anchor_total += int(
             one_turn.get("n_posthoc_suffix_skipped_anchor_only", 0)
+        )
+        posthoc_skipped_acc1_oor_total += int(
+            one_turn.get("n_posthoc_suffix_skipped_acc1_out_of_range", 0)
         )
         posthoc_executed_total += int(
             one_turn.get("n_posthoc_suffix_refine_executed", 0)
@@ -317,6 +323,7 @@ def summarize_question_stats(turn_stats, responses=None):
         "posthoc_suffix_refine_pairs": posthoc_pairs_flat,
         "n_posthoc_suffix_refine_executed": posthoc_executed_total,
         "n_posthoc_suffix_skipped_anchor_only": posthoc_skipped_anchor_total,
+        "n_posthoc_suffix_skipped_acc1_out_of_range": posthoc_skipped_acc1_oor_total,
         "n_posthoc_suffix_events": len(posthoc_pairs_flat),
         "target_posthoc_extra_time": target_posthoc_extra,
     }
@@ -491,6 +498,18 @@ def main():
         help="后验实验：每验证步在已知 target 接受前缀后，对后缀再草稿一次并二次验证，"
         "统计 accept 长度增量（不改变真实解码轨迹；额外 target 计入手动字段）。",
     )
+    parser.add_argument(
+        "--posthoc-acc1-min",
+        type=int,
+        default=2,
+        help="后验仅当首验 acc1 属于 [min,max] 且 acc1<块长时做二次迭代；<min 不迭代（默认 2）。",
+    )
+    parser.add_argument(
+        "--posthoc-acc1-max",
+        type=int,
+        default=14,
+        help="后验 acc1 上界（含）；>max 不二次迭代（默认 14）。",
+    )
     args = parser.parse_args()
 
     if args.emit_trunc_profile and not args.draft_topk_file:
@@ -548,6 +567,8 @@ def main():
         "use_draft_tree": args.use_draft_tree,
         "draft_tree_branches": args.draft_tree_branches,
         "record_posthoc_suffix_refine": bool(args.record_posthoc_suffix_refine),
+        "posthoc_acc1_min": int(args.posthoc_acc1_min),
+        "posthoc_acc1_max": int(args.posthoc_acc1_max),
     }
     if args.spec_json:
         with open(args.spec_json, "r", encoding="utf-8") as sf:
