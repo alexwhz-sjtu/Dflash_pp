@@ -42,7 +42,14 @@
 ## 1. 训练目标
 
 - 详见 **`iterative_block_generation_design.md`**：块内状态 `z^{(t)}`（干净前缀 + mask 后缀）、条件为 target 融合 hidden；损失可含原有 DFlash 块内 CE 与连续性/迭代对齐相关项。
-- 本仓库当前测评默认草稿权重：`cache/models/flashmtp_v3.1_nemotron_think_on_samples_40000_qwen3_8b/epoch_6_step_12750`（`eval/eval.py` 中 `dflash-pp-trained`）。
+
+## 2. L_con 干净前缀与推理路径对齐
+
+- **结构**：`scripts/train_dflash_pp.py` 为训练入口，超参在 `scripts/run_training_dflash_pp.sh` 中注入；`specforge/core/dflash_pp.py` 的 `OnlineDFlashPPModel` 将 **L_dflash** 与 **L_con** 合并在**一次** draft 前向中完成：沿 batch 维拼接「标准 DFlash 块噪声」与「completion 噪声」，对两半 logits 分别计算损失。
+- **L_con 块内状态构造**：用 `_sample_prefix_lengths` 得到每个锚点块上的干净前缀长度 `p`，再经 `_create_noise_embed_completion` 在块内把 **第 `p` 个及之后** 的位置换成 mask、之前位置用真值 token 嵌入。即 L_con 学的是「给定已对齐的**一段**前缀，补全余下后缀」。
+- **与推理一致的约束**：干净前缀采样的**边界**不落在块内最前三格。块内位置 **0（anchor）**、**1**、**2** 在 L_con 分支中**始终**为干净真值，等价于只从 `p ∈ {3,…,B-1}` 中按原有 `w,b` 的 softmax 分布采样「mask 起点」；0/1/2 不会被选成「从该位起全 mask 后缀」的切分点。
+- **动机**：后验实验（见下节 §四.1）表明，**第一次** target 接受长度 **≤2** 时，再做多一轮块内去噪**几乎无**接受长度增量；故推理上规定该情况**不**进入第二次迭代。训练侧将 L_con 的随机前缀与之一致，避免强监督大量「首段极短、推理从不走第二轮」的补全模式。
+
 
 ---
 
@@ -66,22 +73,12 @@
 
 **数据**：
 
-硬性设定为迭代两次时：`mean_posthoc_suffix_accept_gain ≈ 0.65`；
-发现对于第一次接收长度小于等于2的部分，再次迭代一直没有收益，说明此处本身就有难度，继续预测没有收益。因此规定第一次预测截断点小于等于2的不进行下一次迭代。
-此时`mean_posthoc_suffix_accept_gain ≈ 1.29`
+- 硬性设定为迭代两次时：`mean_posthoc_suffix_accept_gain ≈ 0.65`；
+- 发现**第一次**接受长度 **≤2** 的块上，**再**迭代去噪**几乎无**收益，故推理侧规定该情况不进入第二次块内迭代；**训练**侧 L_con 的干净前缀长度仅采样 `p ≥ 3`（块内前三格恒干净），与上述决策对齐（见 **§三.2**）。
+- 在应用该推理规则后，后验度量的 `mean_posthoc_suffix_accept_gain` 可升至约 `1.29` 量级（依具体脚本与子集而定）。
 
 **复现**：
 
-```bash
-source .venv/bin/activate
-python eval/eval.py --model-pair dflash-pp-trained \
-  --question-file /path/to/mtbench101/question.jsonl \
-  --begin 0 --end 1 --max-length 256 \
-  --max-block-inner-iters 1 --truncation-policy full \
-  --record-posthoc-suffix-refine \
-  --output-dir eval/trunck/posthoc_run \
-  --emit-run-summary-json eval/trunck/posthoc_suffix_refine_summary.json
-```
 
 【状态】**已完成（代码 + 示例数据）**；更大 `begin/end`、不同 `truncation_policy` 可继续扫 `eval/trunck/`。
 

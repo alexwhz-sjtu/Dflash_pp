@@ -15,7 +15,8 @@ class OnlineDFlashPPModel(nn.Module):
     """DFlash++ online training: L_dflash (original) + λ · L_con (clean-prefix completion).
 
     One draft forward stacks both masks on the batch dimension (2×batch), then splits logits.
-    L_con prefix length p ∈ {1,…,B-1}: sampled with P(p) ∝ exp(-w·(p-1-b)) (w=0 → uniform).
+    L_con 前缀长度 p ∈ {K,…,B-1}，K=`lcon_min_prefix_len`（块内前 K 个位置恒为干净，与推理一致);
+    P(p) ∝ exp(-w·(p-1-b)²) 仅在上述集合上归一化 (w=0 → 均匀).
     """
 
     def __init__(
@@ -33,6 +34,7 @@ class OnlineDFlashPPModel(nn.Module):
         completion_gamma: Optional[float] = None,
         completion_prefix_sample_weight: float = 1.0,
         completion_prefix_sample_bias: float = 0.0,
+        lcon_min_prefix_len: int = 3,
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -48,6 +50,7 @@ class OnlineDFlashPPModel(nn.Module):
         self.completion_gamma = completion_gamma
         self.completion_prefix_sample_weight = completion_prefix_sample_weight
         self.completion_prefix_sample_bias = completion_prefix_sample_bias
+        self.lcon_min_prefix_len = int(lcon_min_prefix_len)
 
     def _sample_anchor_positions(
         self, seq_len: int, loss_mask: torch.Tensor, device: torch.device
@@ -163,22 +166,23 @@ class OnlineDFlashPPModel(nn.Module):
     def _sample_prefix_lengths(
         self, bsz: int, n: int, device: torch.device
     ) -> torch.Tensor:
-        """Sample p ∈ {1,…,B-1}. P(p) = softmax(logits), logits_p = -w * (p - 1 - b)^2.
+        """Sample p ∈ {K,…,B-1}, K=`lcon_min_prefix_len`. logits_p = -w * (p - 1 - b)^2.
 
-        Note: linear -w*(p-1-b) is softmax-invariant in b because +w*b is constant over p.
-        Squared form makes b shift the mode: peak near p ≈ 1 + b (within {1,…,B-1}).
-        w=0 → uniform; larger w → sharper around that mode.
+        块内前 K 个位置不作为「mask 起点」被采样。Note: linear -w*(p-1-b) is softmax-invariant
+        in b. Squared form makes b shift the mode: peak near p ≈ 1 + b (clipped to allowed set).
+        w=0 → uniform over allowed p; larger w → sharper around that mode.
         """
         bs = self.block_size
+        min_p = int(self.lcon_min_prefix_len)
         w = self.completion_prefix_sample_weight
         b = self.completion_prefix_sample_bias
-        idx = torch.arange(1, bs, device=device, dtype=torch.float32)
+        idx = torch.arange(min_p, bs, device=device, dtype=torch.float32)
         centered = idx - 1.0 - b
         logits = -w * centered * centered
         probs = F.softmax(logits, dim=-1)
         total = bsz * n
         flat = torch.multinomial(probs, num_samples=total, replacement=True)
-        return (flat + 1).view(bsz, n).long()
+        return (flat + min_p).view(bsz, n).long()
 
     def _loss_dflash_from_logits(
         self,
@@ -322,9 +326,10 @@ class OnlineDFlashPPModel(nn.Module):
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
-        if self.block_size < 2:
+        k = int(self.lcon_min_prefix_len)
+        if k < 1 or k >= self.block_size:
             raise ValueError(
-                "DFlash++ L_con requires block_size >= 2 for prefix p in [1, B-1]."
+                f"lcon_min_prefix_len (K) must satisfy 1 <= K < block_size; got K={k}, B={self.block_size}."
             )
 
         anchor_positions, block_keep_mask = self._sample_anchor_positions(

@@ -502,7 +502,8 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         draft_topk: int = 2,
         calibration_records: Optional[List[Dict[str, Any]]] = None,
         record_posthoc_suffix_refine: bool = False,
-        posthoc_acc1_min: int = 3,
+        min_prefix_len: int = 3,
+        posthoc_acc1_min: Optional[int] = None,
         posthoc_acc1_max: int = 14,
     ):
         """Speculative generation with optional DFlash++ in-block iteration and draft tree.
@@ -514,12 +515,19 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         first refine round, so no extra information. KV caches are snapshot/restored so the
         real decode path is unchanged.
 
-        Posthoc runs only when ``posthoc_acc1_min`` <= first-accept length ``acc1`` <=
+        ``min_prefix_len`` (K): align with L_con training — block in-draft second **inner** round
+        is skipped if the first round leaves ``num_confirmed < K``; posthoc second pass uses
+        ``acc1 >= (posthoc_acc1_min or K)`` by default.
+
+        Posthoc runs only when lower bound <= first-accept length ``acc1`` <=
         ``posthoc_acc1_max`` (and acc1 < block size). Outside this range the second pass is
-        skipped (default min=3, max=14).
+        skipped (default lower bound: ``posthoc_acc1_min`` or ``min_prefix_len``; max=14).
         """
         self.eval()
         max_block_inner_iters = max(1, min(3, int(max_block_inner_iters)))
+        _min_p = int(min_prefix_len)
+        if _min_p < 1:
+            _min_p = 1
         t_target = 0.0
         t_draft = 0.0
         steps = 0
@@ -536,7 +544,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         posthoc_suffix_skipped_anchor_only = 0
         posthoc_suffix_skipped_acc1_out_of_range = 0
         t_target_posthoc_extra = 0.0
-        _ph_min = int(posthoc_acc1_min)
+        _ph_min = int(posthoc_acc1_min) if posthoc_acc1_min is not None else _min_p
         _ph_max = int(posthoc_acc1_max)
 
         device = target.device
@@ -668,6 +676,9 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 num_confirmed += k
                 inner_used += 1
                 if policy == "full" or max_block_inner_iters == 1:
+                    break
+                # 与训练 L_con 对齐：首轮 in-block 后已确认位置仍少于 K 则不再进下一轮 inner
+                if num_confirmed < _min_p:
                     break
             if num_confirmed < block_size:
                 block_tensor[:, num_confirmed:] = mask_id
@@ -854,7 +865,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 posthoc_suffix_skipped_acc1_out_of_range += 1
             # acc1==1 时仅块内位置 0 被接受，与首轮 refine 的「仅确认块首、后缀全 mask」相同；
             # 同条件 target_hidden/KV 下二次 suffix 草稿与首轮等价（greedy 下无新信息），跳过。
-            # acc1 不在 [posthoc_acc1_min, posthoc_acc1_max] 时不做后验二次迭代（默认 [2,14]）。
+            # acc1 不在 [posthoc 下界, posthoc_acc1_max] 时不做后验二次迭代；下界默认同 min_prefix_len。
             if (
                 record_posthoc_suffix_refine
                 and not use_draft_tree
@@ -993,6 +1004,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             "truncation_policy": truncation_policy,
             "trunc_tau": trunc_tau,
             "use_draft_tree": use_draft_tree,
+            "min_prefix_len": _min_p,
             "record_posthoc_suffix_refine": record_posthoc_suffix_refine,
             "posthoc_suffix_refine_gains": posthoc_suffix_refine_gains,
             "posthoc_suffix_refine_pairs": posthoc_suffix_refine_pairs,

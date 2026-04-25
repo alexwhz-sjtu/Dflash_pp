@@ -108,14 +108,20 @@ def parse_args():
         "--completion-prefix-sample-weight",
         type=float,
         default=1.0,
-        help="L_con prefix p sampling: logits_p = -w*(p-1-b)^2, P=softmax(logits). "
-        "w=0 → uniform on p∈[1,B-1]; larger w → sharper peak near p≈1+b.",
+        help="L_con prefix p sampling: logits_p = -w*(p-1-b)^2, P=softmax(logits) on p∈{3,…,B-1} "
+        "(块内 0,1,2 恒干净). w=0 → uniform; larger w → sharper peak near p≈1+b (clipped to allowed p).",
     )
     model_group.add_argument(
         "--completion-prefix-sample-bias",
         type=float,
         default=0.0,
         help="L_con sampling: peak of -w*(p-1-b)^2 near p≈1+b (within 1..B-1).",
+    )
+    model_group.add_argument(
+        "--lcon-min-prefix-len",
+        type=int,
+        default=3,
+        help="L_con 采样的 p 下界 K：块内前 K 个位置恒为干净，p∈{K,…,B-1}；需 1<=K<B。",
     )
 
     eval_group = parser.add_argument_group("eval (test-in-loop)")
@@ -604,6 +610,7 @@ def main():
         completion_gamma=completion_gamma,
         completion_prefix_sample_weight=args.completion_prefix_sample_weight,
         completion_prefix_sample_bias=args.completion_prefix_sample_bias,
+        lcon_min_prefix_len=args.lcon_min_prefix_len,
     )
 
     dflash_pp_model = FSDP(

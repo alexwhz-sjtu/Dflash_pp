@@ -44,23 +44,108 @@ fi
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 
-# 分布式：与 PyTorch/调度器常见变量对齐（多机时由平台注入）
-# 说明：全局进程 RANK 与「节点下标」不同，--node-rank 只用 PET_NODE_RANK 或 NODE_RANK，勿用 RANK。
-if [ -n "${PET_NPROC_PER_NODE}" ]; then
+# 分布式：自动从调度器/平台环境变量识别（多机时由平台注入）
+# 优先级: PET_* > 同名单变量 > 从 WORLD_SIZE / SLURM 等推断
+# 说明: 全局进程 RANK 与「节点下标」不同；torch 的 RANK 仅在未提供 NODE_R相关变量时用于推算 NODE_RANK=RANK/NPROC_PER_NODE
+
+# 1) 每机进程数
+if [ -n "${PET_NPROC_PER_NODE:-}" ]; then
     NPROC_PER_NODE="${PET_NPROC_PER_NODE}"
+elif [ -n "${NPROC_PER_NODE:-}" ]; then
+    NPROC_PER_NODE="${NPROC_PER_NODE}"
 else
-    NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+    NPROC_PER_NODE=8
 fi
-NNODES="${PET_NNODES:-${NNODES:-1}}"
-NODE_RANK="${PET_NODE_RANK:-${NODE_RANK:-0}}"
-MASTER_ADDR="${MASTER_ADDR:-${PET_MASTER_ADDR:-127.0.0.1}}"
-MASTER_PORT="${MASTER_PORT:-${PET_MASTER_PORT:-29502}}"
+
+# 2) 机器数: PET/NNODES > 从 WORLD_SIZE 推断 > 1
+if [ -n "${PET_NNODES:-}" ]; then
+    NNODES="${PET_NNODES}"
+elif [ -n "${NNODES:-}" ]; then
+    NNODES="${NNODES}"
+elif [ -n "${WORLD_SIZE:-}" ] && [ "${NPROC_PER_NODE}" -gt 0 ] 2>/dev/null; then
+    NNODES=$(( WORLD_SIZE / NPROC_PER_NODE ))
+    if [ $(( WORLD_SIZE % NPROC_PER_NODE )) -ne 0 ] 2>/dev/null; then
+        echo "警告: WORLD_SIZE=${WORLD_SIZE} 不能整除 NPROC_PER_NODE=${NPROC_PER_NODE}，已按 floor 得到 NNODES=${NNODES}" >&2
+    fi
+else
+    NNODES=1
+fi
+if [ "${NNODES}" -lt 1 ] 2>/dev/null; then
+    echo "警告: NNODES=${NNODES} 无效，回退为 1" >&2
+    NNODES=1
+fi
+
+# 3) 当前节点序号: 勿用裸 RANK 当节点号；若仅有全局 RANK 则 NODE_RANK=RANK//NPROC
+if [ -n "${PET_NODE_RANK:-}" ]; then
+    NODE_RANK="${PET_NODE_RANK}"
+elif [ -n "${NODE_RANK:-}" ]; then
+    NODE_RANK="${NODE_RANK}"
+elif [ -n "${SLURM_NODEID:-}" ]; then
+    NODE_RANK="${SLURM_NODEID}"
+elif [ -n "${RANK:-}" ] && [ "${NPROC_PER_NODE}" -gt 0 ] 2>/dev/null; then
+    NODE_RANK=$(( RANK / NPROC_PER_NODE ))
+else
+    NODE_RANK=0
+fi
+
+# 4) 主节点地址/端口: PET_ 优先于无前缀
+if [ -n "${PET_MASTER_ADDR:-}" ]; then
+    MASTER_ADDR="${PET_MASTER_ADDR}"
+elif [ -n "${MASTER_ADDR:-}" ]; then
+    MASTER_ADDR="${MASTER_ADDR}"
+else
+    MASTER_ADDR=127.0.0.1
+fi
+
+if [ -n "${PET_MASTER_PORT:-}" ]; then
+    MASTER_PORT="${PET_MASTER_PORT}"
+elif [ -n "${MASTER_PORT:-}" ]; then
+    MASTER_PORT="${MASTER_PORT}"
+else
+    MASTER_PORT=29502
+fi
+
+# 便于子进程/调试与文档一致
+export NPROC_PER_NODE NNODES NODE_RANK MASTER_ADDR MASTER_PORT
 
 # 多机时 master 不能停留在默认本机，否则无法互连
 if [ "${NNODES}" -gt 1 ] 2>/dev/null && { [ "${MASTER_ADDR}" = "127.0.0.1" ] || [ "${MASTER_ADDR}" = "localhost" ]; }; then
     echo "错误: 多机训练 (NNODES=${NNODES}) 须设置 MASTER_ADDR 或 PET_MASTER_ADDR 为可互通的主节点地址。" >&2
     exit 1
 fi
+
+# 多机时: torchrun / c10d 要求「每个节点」都能解析 MASTER_ADDR。若平台注入的是 K8s/作业
+# 专用主机名 (如 *-master-0)，而 worker 的 DNS/hosts 中不存在该名，会报:
+#   gai error: -2 - Name or service not known
+# 可借鉴的修复 (任选其一，推荐前两种):
+#   1) 在作业/模板里将 PET_MASTER_ADDR 或 MASTER_ADDR 设为主节点「数字 IP」而非主机名
+#   2) 各节点为 master 补 hosts:  主上 hostname -I 得 IP 后,  各机 echo "<IP> <master主机名>" >> /etc/hosts
+#   3) Kubernetes: 在 Pod 上使用 hostAliases 映射 master 名 -> IP
+# 设 STRICT_MASTER_RESOLVE=1 时，本机若无法解析则直接退出
+resolve_master_ok=1
+if [ "${NNODES}" -gt 1 ] 2>/dev/null && [ -n "${MASTER_ADDR}" ] && [ "${MASTER_ADDR}" != "127.0.0.1" ] && [ "${MASTER_ADDR}" != "localhost" ]; then
+    if command -v getent >/dev/null 2>&1; then
+        if ! getent ahosts "${MASTER_ADDR}" >/dev/null 2>&1; then
+            resolve_master_ok=0
+        fi
+    elif command -v python3 >/dev/null 2>&1; then
+        if ! _CHECK_MASTER_ADDR="${MASTER_ADDR}" python3 -c "import os, socket; socket.getaddrinfo(os.environ['_CHECK_MASTER_ADDR'], None)" >/dev/null 2>&1; then
+            resolve_master_ok=0
+        fi
+    fi
+    if [ "${resolve_master_ok}" -eq 0 ]; then
+        echo "============================================" >&2
+        echo "警告: 本机无法解析 MASTER_ADDR='${MASTER_ADDR}' (c10d/TCPStore 会连接失败: Name or service not known)。" >&2
+        echo "  请改用主节点 IP 作为 MASTER_ADDR/PET_MASTER_ADDR，或在本机 /etc/hosts 中追加: <IP> ${MASTER_ADDR}" >&2
+        echo "  (主节点上可用 hostname -I 查看可互通网卡 IP。)" >&2
+        if [ -n "${STRICT_MASTER_RESOLVE:-}" ] && [ "${STRICT_MASTER_RESOLVE}" != "0" ] && [ "${STRICT_MASTER_RESOLVE}" != "false" ]; then
+            echo "已设置 STRICT_MASTER_RESOLVE，退出。" >&2
+            exit 1
+        fi
+        echo "============================================" >&2
+    fi
+fi
+unset resolve_master_ok
 
 NUM_EPOCHS="${NUM_EPOCHS:-8}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
@@ -104,6 +189,8 @@ COMPLETION_LOSS_WEIGHT="${COMPLETION_LOSS_WEIGHT:-0.6}"
 COMPLETION_GAMMA="${COMPLETION_GAMMA:-7}"
 COMPLETION_PREFIX_SAMPLE_WEIGHT="${COMPLETION_PREFIX_SAMPLE_WEIGHT:-0.05}"
 COMPLETION_PREFIX_SAMPLE_BIAS="${COMPLETION_PREFIX_SAMPLE_BIAS:-0.0}"
+# 与推理对齐：L_con 的 p 下界 K（块内前 K 个位置恒干净）；eval 中 min_prefix_len / 后验 acc1 下界默认同此值
+LCON_MIN_PREFIX_LEN="${LCON_MIN_PREFIX_LEN:-3}"
 
 # 默认不做「训练集前 N 条」eval；单独评估请设 EVAL_DATA_PATH。若需恢复可 export EVAL_TRAIN_MAX_SAMPLES>0
 EVAL_TRAIN_MAX_SAMPLES="${EVAL_TRAIN_MAX_SAMPLES:-0}"
@@ -117,11 +204,11 @@ if [ "$DT" = "qz" ]; then
     # export NODE_RANK=${RANK:-0}
     export WANDB_MODE=offline
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/DFlash_pp_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_lbase_${DFLASH_LOSS_WEIGHT}_lcon_${COMPLETION_LOSS_WEIGHT}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/DFlash_pp_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_lbase_${DFLASH_LOSS_WEIGHT}_lcon_${COMPLETION_LOSS_WEIGHT}_lK${LCON_MIN_PREFIX_LEN}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
     TARGET_MODEL="${TARGET_MODEL:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-8B}"
 else
     TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
-    OUTPUT_DIR="./cache/models/flashmtp_v3.1_nemotron_think_on_samples_40000_qwen3_8b"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/flashmtp_v3.1_nemotron_think_on_samples_40000_qwen3_8b_lK${LCON_MIN_PREFIX_LEN}}"
     TARGET_MODEL="${TARGET_MODEL:-/share/public/public_models/Qwen3-8B}"
 fi
 
@@ -146,7 +233,7 @@ REPORT_TO="${REPORT_TO:-wandb}"
 WANDB_PROJECT="${WANDB_PROJECT:-dflash_pp}"
 WANDB_RUN_NAME="${WANDB_RUN_NAME:-}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"
-WANDB_RUN_ID="${WANDB_RUN_ID:-dflash_pp_sample_${DATA_NUM_SAMPLES}_Lbase_${DFLASH_LOSS_WEIGHT}_Lcon_${COMPLETION_LOSS_WEIGHT}_epochs_${NUM_EPOCHS}}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-dflash_pp_sample_${DATA_NUM_SAMPLES}_Lbase_${DFLASH_LOSS_WEIGHT}_Lcon_${COMPLETION_LOSS_WEIGHT}_lK${LCON_MIN_PREFIX_LEN}_epochs_${NUM_EPOCHS}}"
 
 TP_SIZE="${TP_SIZE:-1}"
 DIST_TIMEOUT="${DIST_TIMEOUT:-30}"
@@ -183,6 +270,7 @@ echo "  DFlash Loss衰减Gamma: ${LOSS_DECAY_GAMMA:-未设置(不启用)}"
 echo "  L_con 权重 λ: ${COMPLETION_LOSS_WEIGHT}"
 echo "  L_con 权重 γ: ${COMPLETION_GAMMA}"
 echo "  L_con 前缀采样 w,b: ${COMPLETION_PREFIX_SAMPLE_WEIGHT}, ${COMPLETION_PREFIX_SAMPLE_BIAS}"
+echo "  L_con 最小干净前缀长度 K: ${LCON_MIN_PREFIX_LEN} (p∈{K,…,B-1})"
 echo "  L_dflash 权重 μ: ${DFLASH_LOSS_WEIGHT}"
 echo "  init-draft-from: ${INIT_DRAFT_FROM:-未设置}"
 echo "------------------------------------------"
@@ -202,15 +290,24 @@ echo "  NODE_RANK: ${NODE_RANK}"
 echo "  NPROC_PER_NODE: ${NPROC_PER_NODE}"
 echo "  MASTER_ADDR: ${MASTER_ADDR}"
 echo "  MASTER_PORT: ${MASTER_PORT}"
-if [ -n "${WORLD_SIZE}" ]; then
-    echo "  (环境) WORLD_SIZE: ${WORLD_SIZE}  (用于对照，实际由 torchrun 设定)"
+if [ -n "${WORLD_SIZE:-}" ]; then
+    echo "  (环境) WORLD_SIZE: ${WORLD_SIZE}  (若未显式设置 NNODES/PET_NNODES，已用于推断 NNODES)"
 fi
-if [ -n "${RANK}" ]; then
-    echo "  (环境) RANK: ${RANK}  (全局进程 rank，与 NODE_RANK 不同)"
+if [ -n "${RANK:-}" ]; then
+    echo "  (环境) RANK: ${RANK}  (全局进程号；未设置 NODE_RANK/PET_NODE_RANK 时用于 NODE_RANK=RANK/NPROC)"
+fi
+if [ -n "${PET_NNODES:-}" ] || [ -n "${PET_NODE_RANK:-}" ] || [ -n "${PET_MASTER_ADDR:-}" ] || [ -n "${PET_MASTER_PORT:-}" ] || [ -n "${PET_NPROC_PER_NODE:-}" ]; then
+    echo "  (环境) PET_NNODES/PET_NODE_RANK/PET_MASTER_*/PET_NPROC_PER_NODE: 已优先于无前缀变量参与解析"
 fi
 echo "  TP_SIZE: ${TP_SIZE}"
 echo "------------------------------------------"
 echo "Tracker: ${REPORT_TO}"
+if [ "${REPORT_TO}" = "wandb" ] || [ "${REPORT_TO}" = "all" ]; then
+    echo "  W&B run id: ${WANDB_RUN_ID}"
+    if [ -n "${WANDB_RUN_NAME}" ]; then
+        echo "  W&B run name: ${WANDB_RUN_NAME}"
+    fi
+fi
 echo "=========================================="
 echo ""
 
@@ -298,6 +395,7 @@ fi
     --completion-gamma ${COMPLETION_GAMMA} \
     --completion-prefix-sample-weight ${COMPLETION_PREFIX_SAMPLE_WEIGHT} \
     --completion-prefix-sample-bias ${COMPLETION_PREFIX_SAMPLE_BIAS} \
+    --lcon-min-prefix-len ${LCON_MIN_PREFIX_LEN} \
     --dflash-loss-weight ${DFLASH_LOSS_WEIGHT} \
     --eval-train-max-samples ${EVAL_TRAIN_MAX_SAMPLES} \
     --eval-max-batches ${EVAL_MAX_BATCHES} \

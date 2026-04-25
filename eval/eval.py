@@ -199,7 +199,7 @@ def multi_turn_dialogue(
                     f"executed={stats.get('n_posthoc_suffix_refine_executed', stats.get('n_posthoc_suffix_events', 0))} | "
                     f"skipped_anchor_only={stats.get('n_posthoc_suffix_skipped_anchor_only', 0)} | "
                     f"skipped_acc1_out_of_range={stats.get('n_posthoc_suffix_skipped_acc1_out_of_range', 0)} | "
-                    f"acc1_range=[{stats.get('posthoc_acc1_min', 2)},{stats.get('posthoc_acc1_max', 14)}] | "
+                    f"acc1_range=[{stats.get('posthoc_acc1_min', 3)},{stats.get('posthoc_acc1_max', 14)}] | "
                     f"target_extra_s={stats.get('target_posthoc_extra_time', 0):.4f}\n"
                 )
             log_file.write(
@@ -493,6 +493,13 @@ def main():
         help="非 grid 模式下，将全部 turn 的汇总指标写入该路径",
     )
     parser.add_argument(
+        "--lcon-min-prefix-len",
+        type=int,
+        default=3,
+        help="与训练 L_con 对齐的块前缀长度下界 K：块内首轮 in-block inner 后若已确认 <K 则不再进"
+        "下一轮；后验二次验证的 acc1 下界默认同 K（可用 --posthoc-acc1-min 显式覆盖）。",
+    )
+    parser.add_argument(
         "--record-posthoc-suffix-refine",
         action="store_true",
         help="后验实验：每验证步在已知 target 接受前缀后，对后缀再草稿一次并二次验证，"
@@ -501,8 +508,8 @@ def main():
     parser.add_argument(
         "--posthoc-acc1-min",
         type=int,
-        default=2,
-        help="后验仅当首验 acc1 属于 [min,max] 且 acc1<块长时做二次迭代；<min 不迭代（默认 2）。",
+        default=None,
+        help="后验仅当 acc1 属于 [min,max] 时做二次验证；<min 跳过。默认与 --lcon-min-prefix-len 相同。",
     )
     parser.add_argument(
         "--posthoc-acc1-max",
@@ -567,9 +574,11 @@ def main():
         "use_draft_tree": args.use_draft_tree,
         "draft_tree_branches": args.draft_tree_branches,
         "record_posthoc_suffix_refine": bool(args.record_posthoc_suffix_refine),
-        "posthoc_acc1_min": int(args.posthoc_acc1_min),
+        "min_prefix_len": int(args.lcon_min_prefix_len),
         "posthoc_acc1_max": int(args.posthoc_acc1_max),
     }
+    if args.posthoc_acc1_min is not None:
+        spec_kw_single["posthoc_acc1_min"] = int(args.posthoc_acc1_min)
     if args.spec_json:
         with open(args.spec_json, "r", encoding="utf-8") as sf:
             spec_kw_single.update(json.load(sf))
@@ -596,7 +605,11 @@ def main():
         grid_rows = []
         for gi, cfg in enumerate(grid):
             flat_turn_stats: List[dict] = []
-            print(f"[grid {gi+1}/{len(grid)}] {cfg}", flush=True)
+            spec_kw_merged = {**spec_kw_single, **cfg}
+            print(
+                f"[grid {gi+1}/{len(grid)}] {cfg} (with min_prefix_len={spec_kw_merged.get('min_prefix_len', 3)})",
+                flush=True,
+            )
             for question in questions:
                 draft_topk_fp = None
                 try:
@@ -618,7 +631,7 @@ def main():
                         debug_dir=args.debug_dir if args.debug else None,
                         draft_topk_file=draft_topk_fp,
                         draft_topk=args.draft_topk,
-                        spec_generate_kw=cfg,
+                        spec_generate_kw=spec_kw_merged,
                     )
                     flat_turn_stats.extend(turn_stats)
                 finally:

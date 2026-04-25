@@ -3,7 +3,8 @@
 """
 模拟 OnlineDFlashPPModel 中 L_con 前缀长度 p 的采样分布。
 
-与训练一致: logits_p = -w * (p - 1 - b)^2,  P(p) = softmax(logits), p ∈ {1, ..., B-1}。
+与训练一致: logits_p = -w * (p - 1 - b)^2,  P(p) = softmax(logits), p ∈ {K, ..., B-1}
+（K=`--min-prefix-len`，块内前 K 格恒为干净）。
 （线性 -w*(p-1-b) 中 +w*b 对 softmax 为常数，b 不会改变分布；故训练侧已改为平方形式。）
 
 用法示例:
@@ -27,12 +28,13 @@ def softmax(logits: Sequence[float]) -> List[float]:
 
 
 def theoretical_probs(
-    block_size: int, weight: float, bias: float
+    block_size: int, weight: float, bias: float, min_prefix_len: int = 3
 ) -> Tuple[List[int], List[float], List[float]]:
     """返回 (p 列表, P(p), 累积概率)."""
-    if block_size < 2:
-        raise ValueError("block_size 必须 >= 2")
-    ps = list(range(1, block_size))
+    k = int(min_prefix_len)
+    if k < 1 or k >= block_size:
+        raise ValueError(f"需 1 <= min_prefix_len < block_size；得 K={k}, B={block_size}")
+    ps = list(range(k, block_size))
     logits = [-weight * (p - 1.0 - bias) ** 2 for p in ps]
     probs = softmax(logits)
     cum = []
@@ -49,9 +51,10 @@ def monte_carlo_counts(
     bias: float,
     n_samples: int,
     seed: int | None = None,
+    min_prefix_len: int = 3,
 ) -> List[int]:
     """按与训练相同的分布多项式采样，返回每个 p 的出现次数。"""
-    ps, probs, _ = theoretical_probs(block_size, weight, bias)
+    ps, probs, _ = theoretical_probs(block_size, weight, bias, min_prefix_len)
     rng = random.Random(seed)
     counts = [0] * len(ps)
     for _ in range(n_samples):
@@ -107,7 +110,13 @@ def main() -> None:
         "--block-size",
         type=int,
         default=16,
-        help="块大小 B，合法 p 为 1..B-1",
+        help="块大小 B；合法 p 为 K..B-1（K=--min-prefix-len）",
+    )
+    parser.add_argument(
+        "--min-prefix-len",
+        type=int,
+        default=3,
+        help="与 --lcon-min-prefix-len 相同；p 下界 K，默认 3",
     )
     parser.add_argument(
         "-w",
@@ -150,13 +159,16 @@ def main() -> None:
     else:
         scenarios.append((f"w={args.weight}, b={args.bias}", args.weight, args.bias))
 
+    k0 = int(args.min_prefix_len)
     print(
-        f"块大小 B={args.block_size}，p ∈ {{1,…,{args.block_size - 1}}}，"
+        f"块大小 B={args.block_size}，K={k0}，p ∈ {{{k0},…,{args.block_size - 1}}}，"
         f"logits_p = -w·(p-1-b)²，P = softmax(logits)"
     )
 
     for si, (label, w, b) in enumerate(scenarios):
-        ps, probs, cum = theoretical_probs(args.block_size, w, b)
+        ps, probs, cum = theoretical_probs(
+            args.block_size, w, b, min_prefix_len=k0
+        )
         counts: List[int] | None = None
         if args.mc > 0:
             counts = monte_carlo_counts(
@@ -165,6 +177,7 @@ def main() -> None:
                 b,
                 args.mc,
                 seed=args.seed + si * 1_000_003,
+                min_prefix_len=k0,
             )
         print_table(label, ps, probs, cum, counts=counts, n_mc=args.mc)
 
