@@ -64,11 +64,11 @@
 
 **代码**：`spec_generate(..., record_posthoc_suffix_refine=True)`；CLI：`eval/eval.py --record-posthoc-suffix-refine`。
 
-**数据（示例一次短跑）**：
+**数据**：
 
-- 配置：mtbench101 `--begin 0 --end 1`，每 turn `max_new_tokens=256`，`max_block_inner_iters=1`，`truncation_policy=full`。
-- 汇总文件：**`eval/trunck/posthoc_suffix_refine_summary.json`**
-- 结果摘要：`mean_posthoc_suffix_accept_gain ≈ 0.65`（在发生「未满块接受」且触发二次验证的步上，平均每次约多接受 **0.65** 个 token）；`n_posthoc_suffix_events` 为这类步数；`target_posthoc_extra_time` 为二次验证额外 target 墙钟（不计入主路径 `target_total_time`）。
+硬性设定为迭代两次时：`mean_posthoc_suffix_accept_gain ≈ 0.65`；
+发现对于第一次接收长度小于等于2的部分，再次迭代一直没有收益，说明此处本身就有难度，继续预测没有收益。因此规定第一次预测截断点小于等于2的不进行下一次迭代。
+此时`mean_posthoc_suffix_accept_gain ≈ 1.29`
 
 **复现**：
 

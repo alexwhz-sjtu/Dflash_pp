@@ -43,8 +43,24 @@ fi
 # ========================================
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
-NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
-MASTER_PORT="${MASTER_PORT:-29502}"
+
+# 分布式：与 PyTorch/调度器常见变量对齐（多机时由平台注入）
+# 说明：全局进程 RANK 与「节点下标」不同，--node-rank 只用 PET_NODE_RANK 或 NODE_RANK，勿用 RANK。
+if [ -n "${PET_NPROC_PER_NODE}" ]; then
+    NPROC_PER_NODE="${PET_NPROC_PER_NODE}"
+else
+    NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+fi
+NNODES="${PET_NNODES:-${NNODES:-1}}"
+NODE_RANK="${PET_NODE_RANK:-${NODE_RANK:-0}}"
+MASTER_ADDR="${MASTER_ADDR:-${PET_MASTER_ADDR:-127.0.0.1}}"
+MASTER_PORT="${MASTER_PORT:-${PET_MASTER_PORT:-29502}}"
+
+# 多机时 master 不能停留在默认本机，否则无法互连
+if [ "${NNODES}" -gt 1 ] 2>/dev/null && { [ "${MASTER_ADDR}" = "127.0.0.1" ] || [ "${MASTER_ADDR}" = "localhost" ]; }; then
+    echo "错误: 多机训练 (NNODES=${NNODES}) 须设置 MASTER_ADDR 或 PET_MASTER_ADDR 为可互通的主节点地址。" >&2
+    exit 1
+fi
 
 NUM_EPOCHS="${NUM_EPOCHS:-8}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
@@ -181,7 +197,17 @@ echo "  梯度裁剪: ${MAX_GRAD_NORM}"
 echo "------------------------------------------"
 echo "分布式配置:"
 echo "  CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
+echo "  NNODES: ${NNODES}"
+echo "  NODE_RANK: ${NODE_RANK}"
 echo "  NPROC_PER_NODE: ${NPROC_PER_NODE}"
+echo "  MASTER_ADDR: ${MASTER_ADDR}"
+echo "  MASTER_PORT: ${MASTER_PORT}"
+if [ -n "${WORLD_SIZE}" ]; then
+    echo "  (环境) WORLD_SIZE: ${WORLD_SIZE}  (用于对照，实际由 torchrun 设定)"
+fi
+if [ -n "${RANK}" ]; then
+    echo "  (环境) RANK: ${RANK}  (全局进程 rank，与 NODE_RANK 不同)"
+fi
 echo "  TP_SIZE: ${TP_SIZE}"
 echo "------------------------------------------"
 echo "Tracker: ${REPORT_TO}"
@@ -205,8 +231,16 @@ echo ""
 echo "==> 开始训练 DFlash++"
 echo ""
 
-if [ "${NPROC_PER_NODE}" -gt 1 ]; then
-    LAUNCHER=(torchrun --nproc_per_node "${NPROC_PER_NODE}" --master_port "${MASTER_PORT}")
+# 多机但每机 1 卡时 NPROC_PER_NODE=1，仍需 torchrun
+if [ "${NPROC_PER_NODE}" -gt 1 ] || [ "${NNODES}" -gt 1 ] 2>/dev/null; then
+    LAUNCHER=(
+        torchrun
+        --nproc_per_node "${NPROC_PER_NODE}"
+        --nnodes "${NNODES}"
+        --node_rank "${NODE_RANK}"
+        --master_addr "${MASTER_ADDR}"
+        --master_port "${MASTER_PORT}"
+    )
 else
     LAUNCHER=(python)
 fi
