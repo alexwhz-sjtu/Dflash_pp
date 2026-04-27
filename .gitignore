@@ -196,7 +196,7 @@ outputs/
 wandb/
 .idea
 .vscode/
-.lock
+*.lock
 
 # macOS
 .DS_Store
