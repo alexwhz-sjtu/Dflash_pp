@@ -117,3 +117,9 @@ python scripts/regenerate_train_data.py \
     --max-tokens 24000 \
     --enable-thinking \
     --output-file-path ./cache/data/regen_data/nemotron_test/nemotron_think_on_samples_test_qwen3.5_9b_regen.jsonl
+
+cd /inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/Dflash_pp && \
+mkdir -p whz_mtp_logs && \
+export NUM_EPOCHS=20 && \
+bash scripts/run_training_dflash_pp.sh --dt qz \
+  > "whz_mtp_logs/train_dflash_pp_qz_dist_$(date +%Y%m%d_%H%M%S).log" 2>&1

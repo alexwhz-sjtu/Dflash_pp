@@ -147,7 +147,7 @@ if [ "${NNODES}" -gt 1 ] 2>/dev/null && [ -n "${MASTER_ADDR}" ] && [ "${MASTER_A
 fi
 unset resolve_master_ok
 
-NUM_EPOCHS="${NUM_EPOCHS:-8}"
+NUM_EPOCHS="${NUM_EPOCHS:-12}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-1}"
 # 按模式默认学习率（仍可用环境变量 LEARNING_RATE 覆盖）
@@ -204,7 +204,7 @@ if [ "$DT" = "qz" ]; then
     # export NODE_RANK=${RANK:-0}
     export WANDB_MODE=offline
     TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/FlashMTP/cache/data/regen_data/nemotron_${DATA_NUM_SAMPLES}/nemotron_think_${ENABLE_THINKING}_samples_${DATA_NUM_SAMPLES}_qwen3_8b_regen.jsonl}"
-    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/DFlash_pp_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_lbase_${DFLASH_LOSS_WEIGHT}_lcon_${COMPLETION_LOSS_WEIGHT}_lK${LCON_MIN_PREFIX_LEN}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./cache/models/DFlash_pp_sample_${DATA_NUM_SAMPLES}_think_${ENABLE_THINKING}_qwen3_8b_lbase_${DFLASH_LOSS_WEIGHT}_lcon_${COMPLETION_LOSS_WEIGHT}_lK${LCON_MIN_PREFIX_LEN}_maxlen${MAX_LENGTH}_epochs${NUM_EPOCHS}_nnodes${NNODES}_dist}"
     TARGET_MODEL="${TARGET_MODEL:-/inspire/hdd/project/inference-chip/xujiaming-253308120313/whz/models/Qwen/Qwen3-8B}"
 else
     TRAIN_DATA_PATH="/share/wanghanzhen/SpeculativeDecoding/NIPS26/FlashMTP_v1.1/cache/data/regen_data/nemotron_40000/nemotron_think_on_samples_40000_qwen3_8b_regen.jsonl"
@@ -233,7 +233,7 @@ REPORT_TO="${REPORT_TO:-wandb}"
 WANDB_PROJECT="${WANDB_PROJECT:-dflash_pp}"
 WANDB_RUN_NAME="${WANDB_RUN_NAME:-}"
 WANDB_DIR="${WANDB_DIR:-./wandb}"
-WANDB_RUN_ID="${WANDB_RUN_ID:-dflash_pp_sample_${DATA_NUM_SAMPLES}_Lbase_${DFLASH_LOSS_WEIGHT}_Lcon_${COMPLETION_LOSS_WEIGHT}_lK${LCON_MIN_PREFIX_LEN}_epochs_${NUM_EPOCHS}}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-dflash_pp_sample_${DATA_NUM_SAMPLES}_Lbase_${DFLASH_LOSS_WEIGHT}_Lcon_${COMPLETION_LOSS_WEIGHT}_lK${LCON_MIN_PREFIX_LEN}_epochs_${NUM_EPOCHS}_nnodes${NNODES}_dist}"
 
 TP_SIZE="${TP_SIZE:-1}"
 DIST_TIMEOUT="${DIST_TIMEOUT:-30}"
